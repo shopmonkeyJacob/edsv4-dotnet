@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <!-- No .pdb files in Release publish output -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <!-- Remove empty localization folders left behind by the SDK after publish -->
+  <Target Name="RemoveEmptyLocalizationFolders" AfterTargets="Publish">
+    <RemoveDir
+      Directories="$(PublishDir)cs;$(PublishDir)de;$(PublishDir)es;$(PublishDir)fr;$(PublishDir)it;$(PublishDir)ja;$(PublishDir)ko;$(PublishDir)pl;$(PublishDir)pt-BR;$(PublishDir)ru;$(PublishDir)tr;$(PublishDir)zh-Hans;$(PublishDir)zh-Hant"
+      ContinueOnError="true" />
+  </Target>
+</Project>
