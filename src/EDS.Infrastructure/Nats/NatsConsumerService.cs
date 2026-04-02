@@ -341,10 +341,12 @@ public sealed class NatsConsumerService : BackgroundService
 
                 if (natsMsg is not null)
                 {
-                    // When paused, NAK the message so it is redelivered after unpause.
+                    // When paused, NAK with a delay so NATS holds the message server-side
+                    // before redelivery. Without the delay NATS redelivers immediately,
+                    // causing a tight loop that wastes bandwidth and CPU.
                     if (_paused)
                     {
-                        await natsMsg.NakAsync(cancellationToken: ct);
+                        await natsMsg.NakAsync(new AckOpts { NakDelay = TimeSpan.FromSeconds(30) }, cancellationToken: ct);
                         continue;
                     }
 
