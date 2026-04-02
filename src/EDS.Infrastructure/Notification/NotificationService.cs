@@ -153,7 +153,16 @@ public sealed class NotificationService : BackgroundService
 
                 case "sendlogs":
                     if (_handlers.SendLogs is not null)
-                        await _handlers.SendLogs();
+                    {
+                        var logsResult = await _handlers.SendLogs();
+                        await PublishResponseAsync(action, new GenericNotificationResponse
+                        {
+                            Success   = logsResult.Success,
+                            Message   = logsResult.Error,
+                            SessionId = _sessionId,
+                            Action    = action
+                        }, ct);
+                    }
                     break;
 
                 case "import":

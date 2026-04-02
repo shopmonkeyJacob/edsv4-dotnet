@@ -304,6 +304,71 @@ public static class SessionService
                 Encoding.UTF8.GetBytes(Dns.GetHostName())))[..16];
     }
 
+    /// <summary>
+    /// Uploads recent log files from <paramref name="dataDir"/> to the Shopmonkey API
+    /// so that support can retrieve them remotely without SSH access to the EDS host.
+    /// Sends at most the 5 most-recently-modified <c>*.log</c> files.
+    /// </summary>
+    public static async Task<(bool success, string? error)> SendLogsAsync(
+        string apiUrl,
+        string apiKey,
+        string sessionId,
+        string dataDir,
+        CancellationToken ct)
+    {
+        try
+        {
+            var logFiles = Directory.GetFiles(dataDir, "*.log", SearchOption.TopDirectoryOnly)
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Take(5)
+                .ToList();
+
+            if (logFiles.Count == 0)
+            {
+                Log.Debug("[sendlogs] No log files found in {DataDir}.", dataDir);
+                return (true, null);
+            }
+
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
+            http.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            http.DefaultRequestHeaders.UserAgent.ParseAdd(
+                $"Shopmonkey EDS Server/{EdsVersion.Current}");
+
+            using var form    = new MultipartFormDataContent();
+            var openedStreams = new List<Stream>();
+            try
+            {
+                foreach (var file in logFiles)
+                {
+                    var stream = new FileStream(
+                        file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    openedStreams.Add(stream);
+                    form.Add(new StreamContent(stream), "logs", file.Name);
+                }
+
+                var response = await http.PostAsync(
+                    $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/logs",
+                    form,
+                    ct);
+
+                response.EnsureSuccessStatusCode();
+                Log.Information("[sendlogs] Uploaded {Count} log file(s) to HQ.", logFiles.Count);
+                return (true, null);
+            }
+            finally
+            {
+                foreach (var s in openedStreams) s.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[sendlogs] Failed to upload logs to HQ.");
+            return (false, ex.Message);
+        }
+    }
+
     internal static string MaskUrl(string url)
     {
         try

@@ -893,6 +893,20 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
             }
         },
 
+        // ── sendlogs: HQ requests log files for remote diagnostics ───────────────
+        SendLogs = async () =>
+        {
+            Log.Information("[sendlogs] Log upload requested by HQ.");
+            var currentApiKey = new ConfigurationBuilder()
+                .AddTomlFile(configPath, optional: true)
+                .AddEnvironmentVariables("EDS_")
+                .Build()["token"] ?? apiKey;
+            var currentApiUrl = SessionService.GetApiUrlFromJwt(currentApiKey);
+            var (success, error) = await SessionService.SendLogsAsync(
+                currentApiUrl, currentApiKey, sessionId, dataDir, CancellationToken.None);
+            return new EDS.Infrastructure.Notification.SendLogsResponse(success, error);
+        },
+
         // ── import: triggered directly from the Shopmonkey web UI ────────────────
         // Runs without any console interaction (NoConfirm = true) — the server may
         // be running headless. Config is re-read at invocation time so that a URL
