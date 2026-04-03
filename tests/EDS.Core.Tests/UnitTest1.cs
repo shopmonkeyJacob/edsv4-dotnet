@@ -1,10 +1,2 @@
-namespace EDS.Core.Tests;
-
-public class UnitTest1
-{
-    [Fact]
-    public void Test1()
-    {
-
-    }
-}
+// Placeholder removed — see SqlHelpersTests, SchemaTests, DbChangeEventTests,
+// ValidationResultTests, RetryHelperTests, DriverRegistryTests.

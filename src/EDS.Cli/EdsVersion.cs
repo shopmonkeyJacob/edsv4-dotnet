@@ -6,12 +6,15 @@ internal static class EdsVersion
 {
     // Set at build time via: dotnet publish -p:Version=v1.2.3-alpha
     // Uses AssemblyInformationalVersion so pre-release suffixes (e.g. -alpha) are preserved.
+    // The SDK appends +{gitCommitHash} as SemVer build metadata — strip it so HQ receives
+    // a clean version string (e.g. "0.8.3-beta" not "0.8.3-beta+decc83c4aceb...").
     // Falls back to "dev" when running from source without an explicit version.
     public static string Current { get; } =
-        typeof(EdsVersion).Assembly
+        (typeof(EdsVersion).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
             ?.InformationalVersion
-            ?? "dev";
+            ?? "dev")
+        .Split('+')[0];
 
     // The Shopmonkey PGP public key — embedded here to match Go's behavior
     public const string ShopmonkeyPublicPgpKey = """
