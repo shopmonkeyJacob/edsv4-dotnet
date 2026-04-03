@@ -1,4 +1,5 @@
 using EDS.Core.Registry;
+using EDS.Drivers.AzureBlob;
 using EDS.Drivers.EventHub;
 using EDS.Drivers.File;
 using EDS.Drivers.Kafka;
@@ -1084,7 +1085,8 @@ static DriverRegistry BuildDriverRegistry()
     r.Register("mysql",      new MySqlDriver());
     r.Register("sqlserver",  new SqlServerDriver());
     r.Register("snowflake",  new SnowflakeDriver());
-    r.Register("s3",         new S3Driver());
+    r.Register("s3",          new S3Driver());
+    r.Register("azureblob",  new AzureBlobDriver());
     r.Register("kafka",      new KafkaDriver());
     r.Register("eventhub",   new EventHubDriver());
     r.Register("file",       new FileDriver());

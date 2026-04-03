@@ -4,20 +4,21 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 
 ## Supported Drivers
 
-| Scheme       | Destination          | Import |
-|--------------|----------------------|:------:|
-| `postgres`   | PostgreSQL           | ✓      |
-| `mysql`      | MySQL / MariaDB      | ✓      |
-| `sqlserver`  | SQL Server           | ✓      |
-| `snowflake`  | Snowflake            | ✓      |
-| `s3`         | Amazon S3            | ✓ ²    |
-| `file`       | Local NDJSON files   | ✓ ²    |
-| `kafka`      | Apache Kafka         |        |
-| `eventhub`   | Azure Event Hubs     |        |
+| Scheme       | Destination              | Import |
+|--------------|--------------------------|:------:|
+| `postgres`   | PostgreSQL               | ✓      |
+| `mysql`      | MySQL / MariaDB          | ✓      |
+| `sqlserver`  | SQL Server               | ✓      |
+| `snowflake`  | Snowflake                | ✓      |
+| `s3`         | Amazon S3                | ✓ ²    |
+| `azureblob`  | Azure Blob Storage       | ✓ ²    |
+| `file`       | Local NDJSON files       | ✓ ²    |
+| `kafka`      | Apache Kafka             |        |
+| `eventhub`   | Azure Event Hubs         |        |
 
-> ² S3 and File drivers transfer raw `.ndjson.gz` export files directly to the destination,
-> preserving the filename and per-table directory structure. No row-level parsing is
-> performed — the export format is already the natural storage format for these drivers.
+> ² S3, Azure Blob Storage, and File drivers transfer raw `.ndjson.gz` export files directly
+> to the destination, preserving the filename and per-table directory structure. No row-level
+> parsing is performed — the export format is already the natural storage format for these drivers.
 
 ## Requirements
 
@@ -80,6 +81,20 @@ eds import --resume
 ```
 
 Because rows are written via MERGE/upsert, any file that was only partially processed when the interruption occurred is safely re-applied from the start. The checkpoint is automatically cleared after a successful full import.
+
+## Driver Connection Strings
+
+### Azure Blob Storage (`azureblob`)
+
+| Auth method       | URL format |
+|-------------------|------------|
+| Account key       | `azureblob://accountname/containername?key=<base64-key>` |
+| Account key + prefix | `azureblob://accountname/containername/myprefix?key=<base64-key>` |
+| Connection string | `azureblob://accountname/containername?connection-string=<uri-encoded-string>` |
+| Azurite emulator  | `azureblob://devstoreaccount1/containername?connection-string=<uri-encoded-string>&endpoint=http%3A%2F%2F127.0.0.1%3A10000%2Fdevstoreaccount1` |
+
+Each CDC event is stored as `{prefix}/{table}/{timestamp}-{id}.json`. During import, raw
+`.ndjson.gz` export files are uploaded directly under `{prefix}/{table}/{filename}`.
 
 ## Building from Source
 
@@ -192,7 +207,15 @@ src/
   EDS.Core/             Interfaces, models, shared helpers
   EDS.Infrastructure/   NATS consumer, schema registry, metrics, upgrade
   EDS.Importer/         Bulk import pipeline (NDJSON/gz)
-  EDS.Drivers.*/        One project per driver
+  EDS.Drivers.PostgreSQL/
+  EDS.Drivers.MySQL/
+  EDS.Drivers.SqlServer/
+  EDS.Drivers.Snowflake/
+  EDS.Drivers.S3/
+  EDS.Drivers.AzureBlob/
+  EDS.Drivers.Kafka/
+  EDS.Drivers.EventHub/
+  EDS.Drivers.File/
 tests/
   EDS.Core.Tests/
   EDS.Infrastructure.Tests/

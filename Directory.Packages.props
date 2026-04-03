@@ -12,6 +12,7 @@
   <!-- Azure -->
   <ItemGroup>
     <PackageVersion Include="Azure.Messaging.EventHubs"                          Version="5.12.2" />
+    <PackageVersion Include="Azure.Storage.Blobs"                                Version="12.22.0" />
   </ItemGroup>
 
   <!-- Kafka -->

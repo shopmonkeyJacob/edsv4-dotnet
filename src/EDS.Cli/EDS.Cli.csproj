@@ -12,6 +12,7 @@
     <ProjectReference Include="..\EDS.Drivers.Kafka\EDS.Drivers.Kafka.csproj" />
     <ProjectReference Include="..\EDS.Drivers.EventHub\EDS.Drivers.EventHub.csproj" />
     <ProjectReference Include="..\EDS.Drivers.File\EDS.Drivers.File.csproj" />
+    <ProjectReference Include="..\EDS.Drivers.AzureBlob\EDS.Drivers.AzureBlob.csproj" />
   </ItemGroup>
 
   <ItemGroup>
