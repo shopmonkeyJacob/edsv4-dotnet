@@ -389,20 +389,6 @@ static async Task RunServerAsync(
         Log.Information("[server] session ended: {SessionId}", sessionId);
     });
 
-    // ── Background: periodic heartbeat ────────────────────────────────────────
-    _ = Task.Run(async () =>
-    {
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(60), ct);
-                await SessionService.SendHeartbeatAsync(apiUrl, apiKey, sessionId, ct);
-            }
-        }
-        catch (OperationCanceledException) { /* normal shutdown */ }
-    }, ct);
-
     // ── Background: credential expiry watcher ────────────────────────────────
     // Re-establishes the session when the NATS credential is within 1 hour of
     // expiring. Stops the host so the process manager can restart with fresh creds.

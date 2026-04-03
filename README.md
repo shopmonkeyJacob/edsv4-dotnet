@@ -33,6 +33,24 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 3. Configure your destination driver in the web interface. EDS will begin streaming
    events as soon as a driver URL is saved.
 
+### macOS: running a downloaded binary
+
+macOS Gatekeeper will block unsigned binaries downloaded from the internet. To allow EDS to run, execute the following command once after extracting the archive:
+
+```sh
+xattr -d com.apple.quarantine ./EDS.Cli
+```
+
+Then make it executable if needed:
+
+```sh
+chmod +x ./EDS.Cli
+```
+
+Alternatively, open **System Settings → Privacy & Security → Security** and click **Open Anyway** after the first blocked launch attempt.
+
+> **Note for production deployments:** This step can be avoided entirely by deploying via a package manager, configuration management tool (Ansible, Chef, etc.), or a container — none of which trigger the Gatekeeper quarantine flag.
+
 ## Commands
 
 | Command                          | Description                                                  |

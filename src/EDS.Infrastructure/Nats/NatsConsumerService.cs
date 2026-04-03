@@ -28,11 +28,12 @@ internal sealed class CredentialInfo
 [MessagePackObject(AllowPrivate = true)]
 internal sealed class HeartbeatPayload
 {
-    [Key("sessionId")] public string         SessionId { get; set; } = "";
-    [Key("offset")]    public long           Offset    { get; set; }
-    [Key("uptime")]    public long           Uptime    { get; set; }
-    [Key("stats")]     public HeartbeatStats Stats     { get; set; } = new();
-    [Key("paused")]    public bool           Paused    { get; set; }
+    [Key("sessionId")] public string          SessionId { get; set; } = "";
+    [Key("offset")]    public long            Offset    { get; set; }
+    [Key("uptime")]    public long            Uptime    { get; set; }
+    [Key("stats")]     public HeartbeatStats  Stats     { get; set; } = new();
+    // Null when active; set to the pause-start timestamp when paused (mirrors Go's *time.Time).
+    [Key("paused")]    public DateTimeOffset? Paused    { get; set; }
 }
 
 [MessagePackObject(AllowPrivate = true)]
@@ -73,7 +74,7 @@ public sealed class NatsConsumerService : BackgroundService
     private readonly EDS.Infrastructure.Metrics.StatusProvider? _status;
     private readonly DateTime _started = DateTime.UtcNow;
     private long _offset;
-    private bool _paused;
+    private DateTimeOffset? _pauseStarted;
     private NatsConnection? _nats;
 
     public NatsConsumerService(
@@ -95,7 +96,7 @@ public sealed class NatsConsumerService : BackgroundService
     /// </summary>
     public void SetPaused(bool paused)
     {
-        _paused = paused;
+        _pauseStarted = paused ? DateTimeOffset.UtcNow : null;
         _status?.SetPaused(paused);
         _logger.LogInformation("[consumer] {Action} by HQ notification.", paused ? "Paused" : "Resumed");
     }
@@ -229,7 +230,7 @@ public sealed class NatsConsumerService : BackgroundService
                 SessionId = sessionId,
                 Offset    = Interlocked.Increment(ref _offset),
                 Uptime    = (long)(DateTime.UtcNow - _started).TotalSeconds,
-                Paused    = _paused,
+                Paused    = _pauseStarted,
                 Stats     = new HeartbeatStats
                 {
                     Metrics = new HeartbeatMetrics
@@ -348,7 +349,7 @@ public sealed class NatsConsumerService : BackgroundService
                     // When paused, NAK with a delay so NATS holds the message server-side
                     // before redelivery. Without the delay NATS redelivers immediately,
                     // causing a tight loop that wastes bandwidth and CPU.
-                    if (_paused)
+                    if (_pauseStarted.HasValue)
                     {
                         await natsMsg.NakAsync(new AckOpts { NakDelay = TimeSpan.FromSeconds(30) }, cancellationToken: ct);
                         continue;

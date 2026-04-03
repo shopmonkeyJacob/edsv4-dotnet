@@ -310,7 +310,10 @@ public static class SessionService
     /// <summary>
     /// Uploads recent log files from <paramref name="dataDir"/> to the Shopmonkey API
     /// so that support can retrieve them remotely without SSH access to the EDS host.
-    /// Sends at most the 5 most-recently-modified <c>*.log</c> files.
+    /// Mirrors the Go sendLogs / getLogUploadURL / uploadLogFile flow:
+    ///   1. POST /v3/eds/internal/{sessionId}/log  → pre-signed upload URL
+    ///   2. Gzip the most-recent log file
+    ///   3. PUT the .gz to the pre-signed URL (Content-Type: application/x-tgz)
     /// </summary>
     public static async Task<(bool success, string? error)> SendLogsAsync(
         string apiUrl,
@@ -321,13 +324,13 @@ public static class SessionService
     {
         try
         {
-            var logFiles = Directory.GetFiles(dataDir, "*.log", SearchOption.TopDirectoryOnly)
+            // Pick the most-recently-modified .log file (Go uploads one at a time).
+            var logFile = Directory.GetFiles(dataDir, "*.log", SearchOption.TopDirectoryOnly)
                 .Select(f => new FileInfo(f))
                 .OrderByDescending(f => f.LastWriteTimeUtc)
-                .Take(5)
-                .ToList();
+                .FirstOrDefault();
 
-            if (logFiles.Count == 0)
+            if (logFile is null)
             {
                 Log.Debug("[sendlogs] No log files found in {DataDir}.", dataDir);
                 return (true, null);
@@ -339,31 +342,45 @@ public static class SessionService
             http.DefaultRequestHeaders.UserAgent.ParseAdd(
                 $"Shopmonkey EDS Server/{EdsVersion.Current}");
 
-            using var form    = new MultipartFormDataContent();
-            var openedStreams = new List<Stream>();
+            // Step 1: request a pre-signed upload URL from HQ.
+            var urlResp = await http.PostAsync(
+                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/log",
+                new StringContent("{}", Encoding.UTF8, "application/json"),
+                ct);
+            urlResp.EnsureSuccessStatusCode();
+
+            var urlJson = await urlResp.Content.ReadAsStringAsync(ct);
+            using var urlDoc  = JsonDocument.Parse(urlJson);
+            var uploadUrl = urlDoc.RootElement
+                .GetProperty("data").GetProperty("url").GetString()
+                ?? throw new InvalidOperationException("No upload URL in response.");
+
+            // Step 2: gzip the log file to a temp path.
+            var gzPath = logFile.FullName + ".gz";
             try
             {
-                foreach (var file in logFiles)
-                {
-                    var stream = new FileStream(
-                        file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                    openedStreams.Add(stream);
-                    form.Add(new StreamContent(stream), "logs", file.Name);
-                }
+                await using (var src  = new FileStream(logFile.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                await using (var dst  = File.Create(gzPath))
+                await using (var gz   = new System.IO.Compression.GZipStream(dst, System.IO.Compression.CompressionLevel.Optimal))
+                    await src.CopyToAsync(gz, ct);
 
-                var response = await http.PostAsync(
-                    $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/logs",
-                    form,
-                    ct);
+                // Step 3: PUT the gzipped file to the pre-signed URL.
+                await using var gzStream = File.OpenRead(gzPath);
+                var putContent = new StreamContent(gzStream);
+                putContent.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-tgz");
 
-                response.EnsureSuccessStatusCode();
-                Log.Information("[sendlogs] Uploaded {Count} log file(s) to HQ.", logFiles.Count);
-                return (true, null);
+                using var putReq = new HttpRequestMessage(HttpMethod.Put, uploadUrl) { Content = putContent };
+                var putResp = await http.SendAsync(putReq, ct);
+                putResp.EnsureSuccessStatusCode();
             }
             finally
             {
-                foreach (var s in openedStreams) s.Dispose();
+                if (File.Exists(gzPath)) File.Delete(gzPath);
             }
+
+            Log.Information("[sendlogs] Uploaded {File} to HQ.", logFile.Name);
+            return (true, null);
         }
         catch (Exception ex)
         {
