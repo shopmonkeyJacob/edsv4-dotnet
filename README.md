@@ -131,9 +131,44 @@ automatically from the git tag (see [Releases](#releases)).
 
 ## Running Tests
 
+The test suite is split into two categories: **unit tests** (no external dependencies) and **integration tests** (require Docker).
+
+### Unit tests
+
+Run all unit tests across the three test projects:
+
 ```sh
-dotnet test
+dotnet test tests/EDS.Core.Tests
+dotnet test tests/EDS.Infrastructure.Tests
+dotnet test tests/EDS.Integration.Tests --filter "Category!=Integration"
 ```
+
+Or run everything at once (integration tests are skipped if Docker is not running):
+
+```sh
+dotnet test --filter "Category!=Integration"
+```
+
+| Project | What is tested |
+|---------|----------------|
+| `EDS.Core.Tests` | SQL helpers, schema column ordering, `DbChangeEvent` logic, `ValidationResult`, `RetryHelper`, `DriverRegistry`, and the `QuoteJsonElement` / `QuoteString` escaping helpers in `SqlDriverBase` |
+| `EDS.Infrastructure.Tests` | `StatusProvider` state management and URL sanitization |
+| `EDS.Integration.Tests` (unit) | `BuildSql` output for PostgreSQL, MySQL, and SQL Server — INSERT, UPDATE (with and without diff), DELETE; special characters, SQL injection strings, Unicode, missing columns → NULL, and cross-driver balanced-quote invariant — all without a database connection |
+
+### Integration tests (Docker required)
+
+Integration tests spin up real database containers via [TestContainers](https://dotnet.testcontainers.org/) and push events through the full `ProcessAsync → FlushAsync` pipeline, verifying that values are stored and retrieved correctly.
+
+**Prerequisites:** Docker Desktop (or any Docker-compatible daemon) must be running.
+
+```sh
+dotnet test tests/EDS.Integration.Tests --filter "Category=Integration"
+```
+
+| Container | What is tested |
+|-----------|----------------|
+| `postgres:16-alpine` | Insert, upsert dedup, update, update-with-diff (partial column update), delete, single-quote strings, SQL injection stored literally, Unicode + emoji, null values, numerics, booleans, newlines in values, multi-row batch commit |
+| `mysql:8.0` | Same core scenarios, plus ISO 8601 → MySQL `TIMESTAMP` reformatting |
 
 ## Configuration
 

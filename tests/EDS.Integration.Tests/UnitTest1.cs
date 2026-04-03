@@ -1,10 +1,2 @@
-namespace EDS.Integration.Tests;
-
-public class UnitTest1
-{
-    [Fact]
-    public void Test1()
-    {
-
-    }
-}
+// Placeholder removed — see Drivers/SqlGenerationTests.cs,
+// Drivers/PostgreSqlIntegrationTests.cs, Drivers/MySqlIntegrationTests.cs.
