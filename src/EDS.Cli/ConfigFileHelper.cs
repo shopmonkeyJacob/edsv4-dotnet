@@ -36,5 +36,10 @@ internal static class ConfigFileHelper
             lines.Add($"{key} = \"{value}\"");
 
         await File.WriteAllTextAsync(configPath, string.Join('\n', lines));
+
+        // Restrict to owner read/write on Unix — the file may contain the API token.
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(configPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 }
