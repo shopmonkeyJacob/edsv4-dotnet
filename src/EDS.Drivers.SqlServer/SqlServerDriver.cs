@@ -115,12 +115,12 @@ public sealed class SqlServerDriver : SqlDriverBase, IDriverHelp
 
     protected override string PropToSqlType(SchemaProperty prop, bool isPrimaryKey = false) => prop.Type switch
     {
-        "string" when isPrimaryKey                => "NVARCHAR(255)",
-        "string" when prop.Format == "date-time"  => "DATETIMEOFFSET",
+        "string" when isPrimaryKey                => "VARCHAR(64)",
         "string"                                  => "NVARCHAR(MAX)",
         "integer"                                 => "BIGINT",
         "number"                                  => "FLOAT",
         "boolean"                                 => "BIT",
+        "array"  when prop.Items?.Enum is not null => "VARCHAR(64)",
         "object" or "array"                       => "NVARCHAR(MAX)",
         _                                         => "NVARCHAR(MAX)"
     };
