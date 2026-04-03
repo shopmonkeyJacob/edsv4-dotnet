@@ -1,0 +1,112 @@
+name: Build & Release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  # ── Build & test ─────────────────────────────────────────────────────────────
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore EDS.sln
+
+      - name: Build
+        run: dotnet build EDS.sln --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test EDS.sln --no-build --configuration Release --logger "console;verbosity=normal"
+
+  # ── Publish cross-platform binaries (version tags only) ──────────────────────
+  publish:
+    name: Publish (${{ matrix.rid }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - rid: osx-arm64
+            artifact: EDS.Cli-osx-arm64
+          - rid: linux-x64
+            artifact: EDS.Cli-linux-x64
+          - rid: win-x64
+            artifact: EDS.Cli-win-x64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish ${{ matrix.rid }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          # Strip leading 'v' so dotnet gets a plain semver (e.g. 0.4.0-alpha)
+          VERSION="${VERSION#v}"
+          dotnet publish src/EDS.Cli \
+            -r ${{ matrix.rid }} \
+            -o publish/${{ matrix.rid }} \
+            -p:Version="${VERSION}"
+
+      - name: Rename binary
+        run: |
+          SRC="publish/${{ matrix.rid }}/EDS.Cli"
+          # Windows publish produces EDS.Cli.exe; others produce EDS.Cli
+          if [ -f "${SRC}.exe" ]; then SRC="${SRC}.exe"; fi
+          cp "${SRC}" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # ── GitHub Release (version tags only) ───────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*
