@@ -111,7 +111,7 @@ public static class SessionService
             ["hostname"]      = Dns.GetHostName(),
             ["ipAddress"]     = ipAddress,
             ["machineId"]     = machineId,
-            ["osinfo"]        = new { os = RuntimeInformation.OSDescription, arch = RuntimeInformation.OSArchitecture.ToString() },
+            ["osinfo"]        = BuildOsInfo(machineId),
             ["serverId"]      = serverId,
             ["supportsImport"] = true,  // Advertise that HQ can trigger data import via the import notification
         };
@@ -445,6 +445,67 @@ public static class SessionService
             return DateTimeOffset.FromUnixTimeSeconds(expProp.GetInt64());
         }
         catch { return DateTimeOffset.MaxValue; }
+    }
+
+    /// <summary>
+    /// Builds the osinfo payload to match the Go binary's structure:
+    /// { host: { hostname, uptime, bootTime, os, platform, platformVersion,
+    ///           kernelVersion, kernelArch, hostId, ... }, num_cpu, go_version }
+    /// </summary>
+    private static object BuildOsInfo(string hostId)
+    {
+        var uptimeSeconds = Environment.TickCount64 / 1000L;
+        var bootTimeUnix  = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - uptimeSeconds;
+        var platform      = GetPlatformString();
+        var kernelVersion = GetKernelVersion();
+
+        return new
+        {
+            host = new
+            {
+                hostname             = Dns.GetHostName(),
+                uptime               = uptimeSeconds,
+                bootTime             = bootTimeUnix,
+                procs                = 0,
+                os                   = platform,
+                platform             = platform,
+                platformFamily       = "Standalone Workstation",
+                platformVersion      = Environment.OSVersion.Version.ToString(),
+                kernelVersion        = kernelVersion,
+                kernelArch           = GetArchString(),
+                virtualizationSystem = "",
+                virtualizationRole   = "",
+                hostId               = hostId,
+            },
+            num_cpu    = Environment.ProcessorCount,
+            go_version = Environment.Version.ToString(),  // .NET runtime version
+        };
+    }
+
+    private static string GetPlatformString() =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.OSX)     ? "darwin"  :
+        RuntimeInformation.IsOSPlatform(OSPlatform.Linux)   ? "linux"   :
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows" : "unknown";
+
+    private static string GetArchString() => RuntimeInformation.OSArchitecture switch
+    {
+        Architecture.Arm64 => "arm64",
+        Architecture.X64   => "x86_64",
+        Architecture.X86   => "i386",
+        Architecture.Arm   => "arm",
+        _                  => RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant()
+    };
+
+    private static string GetKernelVersion()
+    {
+        // On macOS, OSDescription is "Darwin 24.6.0 Darwin Kernel Version..."
+        // Extract the kernel version number (second token).
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            var parts = RuntimeInformation.OSDescription.Split(' ');
+            if (parts.Length > 1) return parts[1];
+        }
+        return Environment.OSVersion.Version.ToString();
     }
 
     internal static string MaskUrl(string url)

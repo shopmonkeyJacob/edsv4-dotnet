@@ -41,6 +41,15 @@ internal sealed class HeartbeatStats
 {
     [Key("metrics")] public HeartbeatMetrics Metrics { get; set; } = new();
     [Key("memory")]  public HeartbeatMemory  Memory  { get; set; } = new();
+    [Key("load")]    public HeartbeatLoad    Load    { get; set; } = new();
+}
+
+[MessagePackObject(AllowPrivate = true)]
+internal sealed class HeartbeatLoad
+{
+    [Key("load1")]  public double Load1  { get; set; }
+    [Key("load5")]  public double Load5  { get; set; }
+    [Key("load15")] public double Load15 { get; set; }
 }
 
 [MessagePackObject(AllowPrivate = true)]
@@ -244,7 +253,8 @@ public sealed class NatsConsumerService : BackgroundService
                         Used        = used,
                         Available   = available,
                         UsedPercent = total > 0 ? (double)used / total * 100.0 : 0
-                    }
+                    },
+                    Load = GetLoadAverages()
                 }
             };
 
@@ -711,5 +721,46 @@ public sealed class NatsConsumerService : BackgroundService
         var padded = input.Replace('-', '+').Replace('_', '/');
         padded += (padded.Length % 4) switch { 2 => "==", 3 => "=", _ => "" };
         return Convert.FromBase64String(padded);
+    }
+
+    /// <summary>
+    /// Returns system load averages (1, 5, 15 minute) matching gopsutil's load.AvgStat.
+    /// Linux reads /proc/loadavg; macOS reads sysctl vm.loadavg; Windows returns zeros.
+    /// </summary>
+    private static HeartbeatLoad GetLoadAverages()
+    {
+        try
+        {
+            if (OperatingSystem.IsLinux() && File.Exists("/proc/loadavg"))
+            {
+                var parts = File.ReadAllText("/proc/loadavg").Split(' ');
+                if (parts.Length >= 3
+                    && double.TryParse(parts[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l1)
+                    && double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l5)
+                    && double.TryParse(parts[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l15))
+                    return new HeartbeatLoad { Load1 = l1, Load5 = l5, Load15 = l15 };
+            }
+
+            if (OperatingSystem.IsMacOS())
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("sysctl", "-n vm.loadavg")
+                    { RedirectStandardOutput = true, UseShellExecute = false };
+                using var proc = System.Diagnostics.Process.Start(psi);
+                if (proc is not null)
+                {
+                    var output = proc.StandardOutput.ReadToEnd().Trim().Trim('{', '}').Trim();
+                    if (!proc.WaitForExit(2_000)) { try { proc.Kill(); } catch { } }
+                    var parts = output.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 3
+                        && double.TryParse(parts[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l1)
+                        && double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l5)
+                        && double.TryParse(parts[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var l15))
+                        return new HeartbeatLoad { Load1 = l1, Load5 = l5, Load15 = l15 };
+                }
+            }
+        }
+        catch { /* best-effort — fall through to zeros */ }
+
+        return new HeartbeatLoad();
     }
 }

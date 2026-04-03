@@ -177,37 +177,30 @@ static async Task RunServerAsync(
             tracker, schemaLogger, apiUrl, EdsVersion.Current, ct);
     }
 
-    // ── Fast path: reuse credential from the last session ────────────────────
-    var resumed = await SessionService.TryResumeAsync(tracker, ct);
-
+    // ── Start a new session with HQ ───────────────────────────────────────────
+    // Always call SendStartAsync on every startup so HQ clears completedDate
+    // and marks the session as active. This mirrors the Go binary, which has
+    // no credential-resume shortcut and always sends a session-start signal.
     string sessionId, credsFile;
-    if (resumed is not null)
+    while (true)
     {
-        (sessionId, credsFile) = resumed.Value;
-    }
-    else
-    {
-        while (true)
+        try
         {
-            try
-            {
-                (sessionId, credsFile) = await SessionService.SendStartAsync(
-                    apiUrl, apiKey, serverId, driverUrl, dataDir, registry, ct);
-                break;
-            }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("already running"))
-            {
-                Log.Information("[server] {Message}", ex.Message);
-                await Task.Delay(TimeSpan.FromSeconds(5), ct);
-            }
+            (sessionId, credsFile) = await SessionService.SendStartAsync(
+                apiUrl, apiKey, serverId, driverUrl, dataDir, registry, ct);
+            break;
         }
-        await tracker.SetKeyAsync(SessionService.LastCredsFileKey, credsFile, ct);
+        catch (InvalidOperationException ex) when (ex.Message.Contains("already running"))
+        {
+            Log.Information("[server] {Message}", ex.Message);
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        }
     }
+    await tracker.SetKeyAsync(SessionService.LastCredsFileKey, credsFile, ct);
 
     var schemaRegistry = schemaTask is not null ? await schemaTask : null;
 
-    Log.Information("[server] session {Action}: {SessionId}",
-        resumed is not null ? "resumed" : "started", sessionId);
+    Log.Information("[server] session started: {SessionId}", sessionId);
 
     if (string.IsNullOrEmpty(driverUrl))
         Log.Information("[server] Return to HQ and continue with configuring your server.");
