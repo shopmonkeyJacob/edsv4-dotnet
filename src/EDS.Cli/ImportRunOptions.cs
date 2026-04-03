@@ -28,6 +28,13 @@ internal sealed record ImportRunOptions
     public bool      Single      { get; init; }
 
     /// <summary>
+    /// When true, load the last saved checkpoint from the tracker and resume
+    /// the import from the first unfinished file. Implies <see cref="NoDelete"/>
+    /// and <see cref="NoCleanup"/>.
+    /// </summary>
+    public bool      Resume      { get; init; }
+
+    /// <summary>
     /// When true, a note is written to the import log indicating this import
     /// was triggered by the post-enrollment prompt rather than the import command.
     /// </summary>

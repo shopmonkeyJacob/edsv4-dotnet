@@ -53,11 +53,27 @@ internal sealed class ExportJobResponse
 
 internal sealed record TableExportInfo(string Table, DateTimeOffset Timestamp);
 
+// ── ImportCheckpoint ──────────────────────────────────────────────────────────
+
+/// <summary>
+/// Persisted snapshot of an in-progress (or interrupted) import run.
+/// Stored in the tracker so <c>eds import --resume</c> can continue without
+/// re-downloading or re-processing already-finished files.
+/// </summary>
+internal sealed class ImportCheckpoint
+{
+    [JsonPropertyName("jobId")]          public string       JobId          { get; init; } = "";
+    [JsonPropertyName("downloadDir")]    public string       DownloadDir    { get; init; } = "";
+    [JsonPropertyName("completedFiles")] public List<string> CompletedFiles { get; init; } = [];
+    [JsonPropertyName("startedAt")]      public DateTimeOffset StartedAt    { get; init; } = DateTimeOffset.UtcNow;
+}
+
 // ── ImportService ─────────────────────────────────────────────────────────────
 
 internal static class ImportService
 {
     private const string TableExportTrackerKey = "import:table-export";
+    internal const string CheckpointTrackerKey  = "import:checkpoint";
 
     // ── Export job ────────────────────────────────────────────────────────────
 
@@ -212,6 +228,20 @@ internal static class ImportService
     {
         var json = await tracker.GetKeyAsync(TableExportTrackerKey, ct);
         return json is null ? null : JsonSerializer.Deserialize<List<TableExportInfo>>(json);
+    }
+
+    // ── Import checkpoint ─────────────────────────────────────────────────────
+
+    public static async Task SaveCheckpointAsync(
+        ITracker tracker, ImportCheckpoint checkpoint, CancellationToken ct) =>
+        await tracker.SetKeyAsync(CheckpointTrackerKey,
+            JsonSerializer.Serialize(checkpoint), ct);
+
+    public static async Task<ImportCheckpoint?> TryLoadCheckpointAsync(
+        ITracker tracker, CancellationToken ct)
+    {
+        var json = await tracker.GetKeyAsync(CheckpointTrackerKey, ct);
+        return json is null ? null : JsonSerializer.Deserialize<ImportCheckpoint>(json);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

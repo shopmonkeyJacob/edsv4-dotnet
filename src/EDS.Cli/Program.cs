@@ -453,13 +453,47 @@ static async Task<bool> RunImportPipelineAsync(
     // ── Initialise driver for import ──────────────────────────────────────────
     await importDriver.InitForImportAsync(importLogger, schemaRegistry, opts.DriverUrl, ct);
 
+    // ── Load checkpoint when --resume is requested ────────────────────────────
+    ImportCheckpoint? existingCheckpoint = null;
+    IReadOnlySet<string> completedFiles  = new HashSet<string>();
+
+    if (opts.Resume)
+    {
+        existingCheckpoint = await ImportService.TryLoadCheckpointAsync(tracker, ct);
+        if (existingCheckpoint is null)
+        {
+            Log.Warning("[import] --resume specified but no checkpoint found; starting fresh.");
+        }
+        else
+        {
+            completedFiles = new HashSet<string>(existingCheckpoint.CompletedFiles, StringComparer.OrdinalIgnoreCase);
+            Log.Information("[import] Resuming import job {JobId} — {N} file(s) already done.",
+                existingCheckpoint.JobId, completedFiles.Count);
+        }
+    }
+
     // ── Resolve download directory ────────────────────────────────────────────
     string downloadDir;
     bool   cleanupDir = false;
     IReadOnlyList<TableExportInfo>? tableInfos = null;
     var jobId = opts.JobId;
 
-    if (!string.IsNullOrEmpty(opts.Dir))
+    if (opts.Resume && existingCheckpoint is not null && string.IsNullOrEmpty(opts.Dir) && string.IsNullOrEmpty(jobId))
+    {
+        // Auto-recover dir and jobId from the saved checkpoint.
+        jobId       = existingCheckpoint.JobId;
+        downloadDir = existingCheckpoint.DownloadDir;
+        cleanupDir  = false;   // keep files so we can resume again if needed
+        tableInfos  = await ImportService.TryLoadTableExportInfoAsync(tracker, ct);
+        Log.Information("[import] Resuming from: {Dir}", downloadDir);
+
+        if (!Directory.Exists(downloadDir))
+        {
+            Log.Fatal("[import] Resume failed — download directory no longer exists: {Dir}", downloadDir);
+            return false;
+        }
+    }
+    else if (!string.IsNullOrEmpty(opts.Dir))
     {
         cleanupDir  = false;
         downloadDir = opts.Dir;
@@ -504,6 +538,22 @@ static async Task<bool> RunImportPipelineAsync(
         Directory.CreateDirectory(downloadDir);
     }
 
+    // ── Initialise / update checkpoint record ─────────────────────────────────
+    // Save a checkpoint record as soon as the download dir is known so that a
+    // crash during the import phase can be resumed with `eds import --resume`.
+    var checkpointKey = ImportService.CheckpointTrackerKey;
+    if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
+    {
+        var checkpoint = new ImportCheckpoint
+        {
+            JobId          = jobId!,
+            DownloadDir    = downloadDir,
+            CompletedFiles = [..completedFiles],
+            StartedAt      = existingCheckpoint?.StartedAt ?? DateTimeOffset.UtcNow,
+        };
+        await ImportService.SaveCheckpointAsync(tracker, checkpoint, ct);
+    }
+
     // ── Derive tables list from download info, filtered by --only ─────────────
     IReadOnlyList<string> importTables;
     if (tableInfos is { Count: > 0 })
@@ -530,10 +580,14 @@ static async Task<bool> RunImportPipelineAsync(
         DryRun         = opts.DryRun,
         Single         = opts.Single,
         SchemaOnly     = opts.SchemaOnly,
-        NoDelete       = opts.NoDelete,
+        NoDelete       = opts.NoDelete || opts.Resume,
         JobId          = jobId,
         MaxParallel    = opts.Parallel,
         Logger         = importLogger,
+        Tracker        = (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
+                             ? tracker : null,
+        CheckpointKey  = checkpointKey,
+        CompletedFiles = completedFiles,
     };
 
     var importer = new EDS.Importer.NdjsonGzImporter(importerConfig);
@@ -553,6 +607,12 @@ static async Task<bool> RunImportPipelineAsync(
         await ImportService.SaveTableExportInfoAsync(tracker, tableInfos, ct);
         Log.Information("[import] Table versions saved for {Count} table(s).", tableInfos.Count);
     }
+
+    // ── Clear checkpoint after a successful full import ───────────────────────
+    // A completed import doesn't need to be resumed, so remove the checkpoint
+    // to avoid accidentally resuming a stale run next time.
+    if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
+        await tracker.DeleteKeyAsync(checkpointKey, ct);
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     if (cleanupDir && Directory.Exists(downloadDir))
@@ -585,6 +645,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     var noDeleteOpt    = new Option<bool>("--no-delete")      { Description = "Do not drop and recreate tables; only insert rows" };
     var schemaOnlyOpt  = new Option<bool>("--schema-only")    { Description = "Create tables only; do not import any rows" };
     var singleOpt      = new Option<bool>("--single")         { Description = "Process one table at a time (no parallelism)" };
+    var resumeOpt      = new Option<bool>("--resume")         { Description = "Resume the last interrupted import from the first unfinished file (implies --no-delete --no-cleanup)" };
 
     var cmd = new Command("import") { Description = "Import a snapshot of Shopmonkey data." };
     cmd.Options.Add(cfgOpt);
@@ -605,6 +666,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     cmd.Options.Add(noDeleteOpt);
     cmd.Options.Add(schemaOnlyOpt);
     cmd.Options.Add(singleOpt);
+    cmd.Options.Add(resumeOpt);
 
     cmd.SetAction(async (parseResult, ct) =>
     {
@@ -639,6 +701,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         var tracker = new EDS.Infrastructure.Tracking.SqliteTracker(Path.Combine(dataDir, "state.db"));
 
+        var resume = parseResult.GetValue(resumeOpt);
         var opts = new ImportRunOptions
         {
             DataDir     = dataDir,
@@ -655,10 +718,11 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
             Parallel    = parseResult.GetValue(parallelOpt),
             DryRun      = parseResult.GetValue(dryRunOpt),
             NoConfirm   = parseResult.GetValue(noConfirmOpt),
-            NoCleanup   = parseResult.GetValue(noCleanupOpt),
+            NoCleanup   = parseResult.GetValue(noCleanupOpt) || resume,
             NoDelete    = parseResult.GetValue(noDeleteOpt),
             SchemaOnly  = parseResult.GetValue(schemaOnlyOpt),
             Single      = parseResult.GetValue(singleOpt),
+            Resume      = resume,
         };
 
         if (!await RunImportPipelineAsync(opts, tracker, ct)) return;

@@ -20,6 +20,25 @@ public sealed class ImporterConfig
     public string? JobId { get; init; }
     public int MaxParallel { get; init; } = 4;
     public ILogger? Logger { get; init; }
+
+    /// <summary>
+    /// Tracker used to persist file-level progress. When set, each completed
+    /// file is checkpointed so an interrupted import can be resumed.
+    /// </summary>
+    public ITracker? Tracker { get; init; }
+
+    /// <summary>
+    /// Key under which the checkpoint JSON is stored in <see cref="Tracker"/>.
+    /// Must be provided whenever <see cref="Tracker"/> is non-null.
+    /// </summary>
+    public string? CheckpointKey { get; init; }
+
+    /// <summary>
+    /// Set of filenames (basename only) already processed in a previous run.
+    /// These files are skipped and counted as done without touching the database.
+    /// When non-empty, the table-recreation step is also skipped (resume mode).
+    /// </summary>
+    public IReadOnlySet<string> CompletedFiles { get; init; } = new HashSet<string>();
 }
 
 /// <summary>
@@ -39,23 +58,33 @@ public sealed class NdjsonGzImporter
 
     /// <summary>
     /// Runs the full import. Mirrors Go's importer.Run():
-    ///   1. If not NoDelete → drop+recreate ALL tables from schema (not just those with files)
+    ///   1. If not NoDelete and not resuming → drop+recreate ALL tables from schema
     ///   2. If SchemaOnly  → return after schema creation
     ///   3. Read NDJSON files, call ImportEventAsync per row, ImportCompletedAsync per table.
+    ///      Already-completed files (from a prior interrupted run) are skipped.
     /// </summary>
     public async Task RunAsync(IImportHandler handler, CancellationToken ct = default)
     {
         var started   = DateTimeOffset.UtcNow;
         var schemaMap = await _config.SchemaRegistry.GetLatestSchemaAsync(ct);
 
+        // ── Resumability: build the mutable completed-files set ───────────────
+        // Pre-seeded from a prior checkpoint so already-finished files are skipped.
+        var completedFiles = new HashSet<string>(_config.CompletedFiles, StringComparer.OrdinalIgnoreCase);
+        bool isResume      = completedFiles.Count > 0;
+
         // ── Drop+recreate ALL tables before any file processing ───────────────
-        // Mirrors Go: handler.CreateDatasource(schema) is called once with the
-        // full schema map before any rows are processed.
-        if (!_config.NoDelete)
+        // Skipped when resuming — tables already exist and are partially populated.
+        if (!_config.NoDelete && !isResume)
         {
             _logger.LogInformation("[import] Dropping and recreating {Count} table(s)...", schemaMap.Count);
             foreach (var (_, schema) in schemaMap)
                 await handler.CreateDatasourceAsync(schema, ct);
+        }
+        else if (isResume)
+        {
+            _logger.LogInformation("[import] Resuming — skipping table recreation ({N} file(s) already done).",
+                completedFiles.Count);
         }
 
         if (_config.SchemaOnly)
@@ -67,6 +96,7 @@ public sealed class NdjsonGzImporter
 
         long totalRows  = 0;
         int  totalFiles = 0;
+        int  skipped    = 0;
         var  byTable    = files.GroupBy(f => f.Table).ToList();
 
         foreach (var tableGroup in byTable)
@@ -83,8 +113,28 @@ public sealed class NdjsonGzImporter
 
             foreach (var file in tableGroup.OrderBy(f => f.Timestamp))
             {
-                rowCount    += await ProcessFileAsync(file.Path, file.Timestamp, schema, handler, ct);
+                var fileName = Path.GetFileName(file.Path);
+
+                // Skip files finished in a previous (interrupted) run.
+                if (completedFiles.Contains(fileName))
+                {
+                    _logger.LogDebug("[import] Skipping already-completed file: {File}", fileName);
+                    skipped++;
+                    continue;
+                }
+
+                rowCount   += await ProcessFileAsync(file.Path, file.Timestamp, schema, handler, ct);
                 totalFiles++;
+
+                // ── Checkpoint: persist this file as done ─────────────────────
+                if (_config.Tracker is not null && _config.CheckpointKey is not null)
+                {
+                    completedFiles.Add(fileName);
+                    await _config.Tracker.SetKeyAsync(
+                        _config.CheckpointKey,
+                        System.Text.Json.JsonSerializer.Serialize(completedFiles),
+                        ct);
+                }
             }
 
             await handler.ImportCompletedAsync(tableName, rowCount, ct);
@@ -93,6 +143,9 @@ public sealed class NdjsonGzImporter
             _logger.LogInformation("[import] {Table}: {Rows} row(s) in {Elapsed}.",
                 tableName, rowCount, DateTimeOffset.UtcNow - tableStarted);
         }
+
+        if (skipped > 0)
+            _logger.LogInformation("[import] Skipped {Skipped} already-completed file(s).", skipped);
 
         _logger.LogInformation("[import] Done: {Rows} row(s) from {Files} file(s) in {Elapsed}.",
             totalRows, totalFiles, DateTimeOffset.UtcNow - started);

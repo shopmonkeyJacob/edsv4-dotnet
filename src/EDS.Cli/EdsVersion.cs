@@ -1,10 +1,17 @@
+using System.Reflection;
+
 namespace EDS.Cli;
 
 internal static class EdsVersion
 {
-    // Set at build time via: dotnet build -p:Version=v3.0.0
+    // Set at build time via: dotnet publish -p:Version=v1.2.3-alpha
+    // Uses AssemblyInformationalVersion so pre-release suffixes (e.g. -alpha) are preserved.
+    // Falls back to "dev" when running from source without an explicit version.
     public static string Current { get; } =
-        typeof(EdsVersion).Assembly.GetName().Version?.ToString() ?? "dev";
+        typeof(EdsVersion).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion
+            ?? "dev";
 
     // The Shopmonkey PGP public key — embedded here to match Go's behavior
     public const string ShopmonkeyPublicPgpKey = """
