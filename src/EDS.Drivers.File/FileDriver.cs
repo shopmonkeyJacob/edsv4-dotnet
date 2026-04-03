@@ -11,7 +11,7 @@ namespace EDS.Drivers.File;
 /// Path pattern: {dir}/{table}/{timestamp}-{id}.json
 /// Useful for bulk export and local testing.
 /// </summary>
-public sealed class FileDriver : IDriver, IDriverLifecycle, IDriverHelp
+public sealed class FileDriver : IDriver, IDriverLifecycle, IDriverHelp, IDriverDirectImport
 {
     private string? _directory;
     private readonly List<(DbChangeEvent evt, string path)> _pending = new();
@@ -67,6 +67,34 @@ public sealed class FileDriver : IDriver, IDriverLifecycle, IDriverHelp
     public Task StopAsync(CancellationToken ct = default)
     {
         _pending.Clear();
+        return Task.CompletedTask;
+    }
+
+    // ── IDriverDirectImport ───────────────────────────────────────────────────
+
+    public Task InitForDirectImportAsync(ILogger logger, string url, CancellationToken ct = default)
+    {
+        var uri = new Uri(url);
+        _directory = uri.LocalPath;
+        Directory.CreateDirectory(_directory);
+        return Task.CompletedTask;
+    }
+
+    public Task ImportFilesAsync(
+        ILogger logger,
+        IReadOnlyList<(string Table, string FilePath)> files,
+        CancellationToken ct = default)
+    {
+        int count = 0;
+        foreach (var (table, src) in files)
+        {
+            var destDir = Path.Combine(_directory!, table);
+            Directory.CreateDirectory(destDir);
+            var dest = Path.Combine(destDir, Path.GetFileName(src));
+            System.IO.File.Copy(src, dest, overwrite: true);
+            count++;
+        }
+        logger.LogInformation("[import] Copied {Count} file(s) to {Dir}.", count, _directory);
         return Task.CompletedTask;
     }
 

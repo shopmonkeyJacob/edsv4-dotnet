@@ -13,7 +13,7 @@ namespace EDS.Drivers.S3;
 /// Stores CDC events as JSON files in an S3-compatible bucket.
 /// Path: s3://{bucket}/{prefix}/{table}/{timestamp}-{id}.json
 /// </summary>
-public sealed class S3Driver : IDriver, IDriverLifecycle, IDriverHelp
+public sealed class S3Driver : IDriver, IDriverLifecycle, IDriverHelp, IDriverDirectImport
 {
     private IAmazonS3? _client;
     private string _bucket = string.Empty;
@@ -85,6 +85,57 @@ public sealed class S3Driver : IDriver, IDriverLifecycle, IDriverHelp
         _client?.Dispose();
         _client = null;
         return Task.CompletedTask;
+    }
+
+    // ── IDriverDirectImport ───────────────────────────────────────────────────
+
+    public Task InitForDirectImportAsync(ILogger logger, string url, CancellationToken ct = default)
+    {
+        (_client, _bucket, _prefix) = CreateClient(url);
+        return Task.CompletedTask;
+    }
+
+    public async Task ImportFilesAsync(
+        ILogger logger,
+        IReadOnlyList<(string Table, string FilePath)> files,
+        CancellationToken ct = default)
+    {
+        long bytes = 0;
+        int  done  = 0;
+
+        await Parallel.ForEachAsync(files, ct, async (entry, innerCt) =>
+        {
+            await _semaphore.WaitAsync(innerCt);
+            try
+            {
+                var (table, filePath) = entry;
+                var tablePath = string.IsNullOrEmpty(_prefix)
+                    ? table
+                    : $"{_prefix.TrimEnd('/')}/{table}";
+                var key = $"{tablePath}/{Path.GetFileName(filePath)}";
+
+                await using var stream = System.IO.File.OpenRead(filePath);
+                var request = new PutObjectRequest
+                {
+                    BucketName  = _bucket,
+                    Key         = key,
+                    InputStream = stream,
+                    ContentType = "application/gzip",
+                };
+                await _client!.PutObjectAsync(request, innerCt);
+
+                Interlocked.Add(ref bytes, new FileInfo(filePath).Length);
+                var n = Interlocked.Increment(ref done);
+                logger.LogDebug("[import] Uploaded {N}/{Total} — s3://{Bucket}/{Key}", n, files.Count, _bucket, key);
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        });
+
+        logger.LogInformation("[import] Uploaded {Count} file(s) ({Bytes:N0} bytes) to s3://{Bucket}/{Prefix}.",
+            done, bytes, _bucket, _prefix);
     }
 
     public IReadOnlyList<DriverField> Configuration() =>

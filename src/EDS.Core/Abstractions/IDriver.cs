@@ -134,3 +134,27 @@ public interface IDriverImport : IImportHandler
     /// </summary>
     Task InitForImportAsync(ILogger logger, ISchemaRegistry registry, string url, CancellationToken ct = default);
 }
+
+/// <summary>
+/// Optional — driver can receive raw CRDB export files (.ndjson.gz) directly,
+/// bypassing the row-by-row parse pipeline. Implement on storage drivers (File, S3)
+/// where the export format is already the natural destination format.
+/// </summary>
+public interface IDriverDirectImport
+{
+    /// <summary>
+    /// Prepares the driver for direct file transfer (e.g. opens credentials,
+    /// resolves the destination path) using the same URL format as normal operation.
+    /// </summary>
+    Task InitForDirectImportAsync(ILogger logger, string url, CancellationToken ct = default);
+
+    /// <summary>
+    /// Transfers each file in <paramref name="files"/> to the driver's destination
+    /// as-is, preserving the CRDB filename. Each entry is a (tableName, absoluteFilePath)
+    /// pair already filtered by --only. No parsing or transformation is performed.
+    /// </summary>
+    Task ImportFilesAsync(
+        ILogger logger,
+        IReadOnlyList<(string Table, string FilePath)> files,
+        CancellationToken ct = default);
+}

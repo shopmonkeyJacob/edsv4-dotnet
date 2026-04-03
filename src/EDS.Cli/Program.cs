@@ -414,8 +414,12 @@ static async Task<bool> RunImportPipelineAsync(
     var driver = driverRegistry.Resolve(scheme)
         ?? throw new InvalidOperationException($"No driver registered for scheme '{scheme}'.");
 
-    if (driver is not EDS.Core.Abstractions.IDriverImport importDriver)
-        throw new InvalidOperationException($"Driver '{scheme}' does not support import (IDriverImport not implemented).");
+    var importDriver     = driver as EDS.Core.Abstractions.IDriverImport;
+    var directImporter   = driver as EDS.Core.Abstractions.IDriverDirectImport;
+
+    if (importDriver is null && directImporter is null)
+        throw new InvalidOperationException(
+            $"Driver '{scheme}' does not support import (implements neither IDriverImport nor IDriverDirectImport).");
 
     // ── Build schema registry ─────────────────────────────────────────────────
     using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(b => b.AddSerilog(Log.Logger));
@@ -437,8 +441,8 @@ static async Task<bool> RunImportPipelineAsync(
         return false;
     }
 
-    // ── Delete confirmation ───────────────────────────────────────────────────
-    if (!opts.NoDelete && !opts.NoConfirm && !opts.SchemaOnly && !opts.DryRun)
+    // ── Delete confirmation (database drivers only) ───────────────────────────
+    if (importDriver is not null && !opts.NoDelete && !opts.NoConfirm && !opts.SchemaOnly && !opts.DryRun)
     {
         Log.Warning("[import] This will DROP and RECREATE all destination tables. Existing data will be lost.");
         Console.Write("Continue? [y/N] ");
@@ -451,7 +455,10 @@ static async Task<bool> RunImportPipelineAsync(
     }
 
     // ── Initialise driver for import ──────────────────────────────────────────
-    await importDriver.InitForImportAsync(importLogger, schemaRegistry, opts.DriverUrl, ct);
+    if (importDriver is not null)
+        await importDriver.InitForImportAsync(importLogger, schemaRegistry, opts.DriverUrl, ct);
+    else if (directImporter is not null)
+        await directImporter.InitForDirectImportAsync(importLogger, opts.DriverUrl, ct);
 
     // ── Load checkpoint when --resume is requested ────────────────────────────
     ImportCheckpoint? existingCheckpoint = null;
@@ -572,26 +579,47 @@ static async Task<bool> RunImportPipelineAsync(
         Log.Information("[import] Importing data to tables: {Tables}", string.Join(", ", importTables));
 
     // ── Run importer ──────────────────────────────────────────────────────────
-    var importerConfig = new EDS.Importer.ImporterConfig
+    if (directImporter is not null)
     {
-        DataDir        = downloadDir,
-        SchemaRegistry = schemaRegistry,
-        Tables         = importTables,
-        DryRun         = opts.DryRun,
-        Single         = opts.Single,
-        SchemaOnly     = opts.SchemaOnly,
-        NoDelete       = opts.NoDelete || opts.Resume,
-        JobId          = jobId,
-        MaxParallel    = opts.Parallel,
-        Logger         = importLogger,
-        Tracker        = (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
-                             ? tracker : null,
-        CheckpointKey  = checkpointKey,
-        CompletedFiles = completedFiles,
-    };
+        // Storage drivers (File, S3): transfer raw .ndjson.gz files as-is.
+        var directFiles = new List<(string Table, string FilePath)>();
+        foreach (var f in Directory.EnumerateFiles(downloadDir, "*.ndjson*", SearchOption.AllDirectories))
+        {
+            if (!EDS.Importer.CrdbFileParser.TryParse(Path.GetFileName(f), out var table, out _))
+                continue;
+            if (importTables.Count > 0 && !importTables.Contains(table, StringComparer.OrdinalIgnoreCase))
+                continue;
+            directFiles.Add((table, f));
+        }
 
-    var importer = new EDS.Importer.NdjsonGzImporter(importerConfig);
-    await importer.RunAsync(importDriver, ct);
+        Log.Information("[import] Direct transfer: {Count} file(s) to {Driver}.", directFiles.Count, scheme);
+        if (!opts.DryRun)
+            await directImporter.ImportFilesAsync(importLogger, directFiles, ct);
+    }
+    else
+    {
+        // Database drivers: parse and upsert row by row.
+        var importerConfig = new EDS.Importer.ImporterConfig
+        {
+            DataDir        = downloadDir,
+            SchemaRegistry = schemaRegistry,
+            Tables         = importTables,
+            DryRun         = opts.DryRun,
+            Single         = opts.Single,
+            SchemaOnly     = opts.SchemaOnly,
+            NoDelete       = opts.NoDelete || opts.Resume,
+            JobId          = jobId,
+            MaxParallel    = opts.Parallel,
+            Logger         = importLogger,
+            Tracker        = (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
+                                 ? tracker : null,
+            CheckpointKey  = checkpointKey,
+            CompletedFiles = completedFiles,
+        };
+
+        var importer = new EDS.Importer.NdjsonGzImporter(importerConfig);
+        await importer.RunAsync(importDriver!, ct);
+    }
 
     // ── Set table versions in registry ────────────────────────────────────────
     if (!opts.DryRun && !opts.SchemaOnly && tableInfos is not null)

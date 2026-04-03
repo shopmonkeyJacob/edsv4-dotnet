@@ -10,10 +10,14 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 | `mysql`      | MySQL / MariaDB      | ✓      |
 | `sqlserver`  | SQL Server           | ✓      |
 | `snowflake`  | Snowflake            | ✓      |
-| `s3`         | Amazon S3            |        |
+| `s3`         | Amazon S3            | ✓ ²    |
+| `file`       | Local NDJSON files   | ✓ ²    |
 | `kafka`      | Apache Kafka         |        |
 | `eventhub`   | Azure Event Hubs     |        |
-| `file`       | Local NDJSON files   |        |
+
+> ² S3 and File drivers transfer raw `.ndjson.gz` export files directly to the destination,
+> preserving the filename and per-table directory structure. No row-level parsing is
+> performed — the export format is already the natural storage format for these drivers.
 
 ## Requirements
 
@@ -65,17 +69,32 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 | `--no-delete`     | Insert rows only; do not drop and recreate tables                 |
 | `--schema-only`   | Create tables without importing any rows                          |
 | `--no-cleanup`    | Keep the temporary download directory after import                |
+| `--resume`        | Resume the last interrupted import from the first unfinished file (implies `--no-delete --no-cleanup`) |
+
+#### Import resumability
+
+EDS checkpoints import progress to `data/state.db` after each file completes. If an import is interrupted (crash, Ctrl-C, network failure), rerun with `--resume` to continue from the first unfinished file without re-downloading or re-dropping tables:
+
+```sh
+eds import --resume
+```
+
+Because rows are written via MERGE/upsert, any file that was only partially processed when the interruption occurred is safely re-applied from the start. The checkpoint is automatically cleared after a successful full import.
 
 ## Building from Source
 
 ```sh
 dotnet build
 
-# Publish self-contained binaries for all platforms
-dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64
-dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64
-dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64
+# Publish self-contained binaries (always pass -p:Version so the version
+# string is stamped into the binary and reported to Shopmonkey HQ)
+dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64  -p:Version=0.4.0-alpha
+dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64  -p:Version=0.4.0-alpha
+dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64    -p:Version=0.4.0-alpha
 ```
+
+Without `-p:Version`, the binary reports version `dev` to HQ. The CI/CD pipeline sets this
+automatically from the git tag (see [Releases](#releases)).
 
 ## Running Tests
 
@@ -90,12 +109,14 @@ At runtime EDS creates a `data/` directory (or the path set by `--data-dir`) con
 | File / Directory        | Description                                              |
 |-------------------------|----------------------------------------------------------|
 | `config.toml`           | Server settings — API token, driver URL, server ID       |
-| `state.db`              | SQLite database for change-tracking state                |
+| `state.db`              | SQLite database for change-tracking and import state     |
 | `<session-id>.log`      | Per-session log file (always captured at Debug level)    |
 | `import-<timestamp>.log`| Log file for each import run                             |
 | `<session-id>/`         | NATS credentials for the current session                 |
 
 > **Keep `data/` out of source control.** It contains your API token and NATS credentials.
+
+`config.toml` is automatically created with `600` permissions (owner read/write only) on macOS and Linux to protect the API token it contains.
 
 ### Example `config.toml`
 
@@ -105,8 +126,7 @@ server_id = "your-server-id"
 url       = "postgres://user:password@localhost:5432/mydb"
 ```
 
-Environment variables prefixed with `EDS_` override any value in `config.toml`
-(e.g. `EDS_TOKEN`, `EDS_URL`).
+Environment variables prefixed with `EDS_` override any value in `config.toml` (e.g. `EDS_TOKEN`, `EDS_URL`).
 
 ## Architecture
 
@@ -116,7 +136,7 @@ Shopmonkey HQ
      ▼
 NatsConsumerService  ──▶  IDriver  ──▶  Destination (SQL, S3, Kafka, …)
      │
-     │  NATS notifications (configure, import, pause, upgrade, …)
+     │  NATS notifications (configure, import, pause, upgrade, sendlogs, …)
      ▼
 NotificationService
 ```
@@ -124,9 +144,12 @@ NotificationService
 - **CDC events** arrive via NATS JetStream, are buffered in a channel, and flushed
   to the driver in batches with exponential-backoff retry on failure.
 - **Notifications** from HQ allow the web interface to configure the driver, trigger
-  a backfill import, pause/unpause streaming, and initiate in-place binary upgrades.
+  a backfill import, pause/unpause streaming, request log uploads, and initiate
+  in-place binary upgrades.
 - **Schema registry** tracks table model versions and triggers DDL migrations when
   the Shopmonkey data model changes.
+- **Pause handling** NAKs messages with a 30-second server-side delay so paused
+  sessions do not create a tight redelivery loop.
 
 ## Project Structure
 
@@ -141,6 +164,8 @@ tests/
   EDS.Core.Tests/
   EDS.Infrastructure.Tests/
   EDS.Integration.Tests/
+Directory.Packages.props  Centralized NuGet package versions (all projects)
+.github/workflows/        CI/CD — build on push, publish on version tag
 ```
 
 ## License
