@@ -218,10 +218,14 @@ static async Task RunServerAsync(
     var serverLogFile = Path.Combine(dataDir, $"{sessionId}.log");
     Log.Information("[server] Session log: {LogFile}", serverLogFile);
 
+    // CTS used to cancel any background import that was started by a notification
+    // handler. Cancelled during ApplicationStopping so imports don't outlive the host.
+    var backgroundImportCts = new CancellationTokenSource();
+
     // Build the handlers object before the host so we can set the five handlers
     // that require IHostApplicationLifetime or NatsConsumerService (available only
     // after host.Build()) by mutating the same reference the NotificationService holds.
-    var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry);
+    var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts);
 
     var host = Host.CreateDefaultBuilder()
         .UseSerilog((_, __, lc) => lc
@@ -373,10 +377,57 @@ static async Task RunServerAsync(
 
     lifetime.ApplicationStopping.Register(() =>
     {
+        // Cancel any in-flight background import so it stops cleanly.
+        backgroundImportCts.Cancel();
+
+        // Upload logs to HQ before saying goodbye (best-effort).
+        SessionService.SendLogsAsync(apiUrl, apiKey, sessionId, dataDir, CancellationToken.None)
+            .GetAwaiter().GetResult();
+
         SessionService.SendEndAsync(apiUrl, apiKey, sessionId, errored: false,
             CancellationToken.None).GetAwaiter().GetResult();
         Log.Information("[server] session ended: {SessionId}", sessionId);
     });
+
+    // ── Background: periodic heartbeat ────────────────────────────────────────
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(60), ct);
+                await SessionService.SendHeartbeatAsync(apiUrl, apiKey, sessionId, ct);
+            }
+        }
+        catch (OperationCanceledException) { /* normal shutdown */ }
+    }, ct);
+
+    // ── Background: credential expiry watcher ────────────────────────────────
+    // Re-establishes the session when the NATS credential is within 1 hour of
+    // expiring. Stops the host so the process manager can restart with fresh creds.
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromMinutes(15), ct);
+                var expiry    = SessionService.GetCredentialExpiry(credsFile);
+                var remaining = expiry - DateTimeOffset.UtcNow;
+                if (remaining <= TimeSpan.FromHours(1))
+                {
+                    Log.Warning("[server] NATS credential expires in {Minutes} min — stopping for renewal.",
+                        (int)remaining.TotalMinutes < 0 ? 0 : (int)remaining.TotalMinutes);
+                    lifetime.StopApplication();
+                    return;
+                }
+                Log.Debug("[server] NATS credential valid for {Hours}h {Min}m.",
+                    (int)remaining.TotalHours, remaining.Minutes);
+            }
+        }
+        catch (OperationCanceledException) { /* normal shutdown */ }
+    }, ct);
 
     await host.RunAsync(ct);
 }
@@ -852,7 +903,8 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
     string driverUrl,
     string apiKey,
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
-    DriverRegistry registry)
+    DriverRegistry registry,
+    CancellationTokenSource backgroundImportCts)
 {
     // Prevents concurrent imports (Configure+backfill and Import notifications could
     // arrive close together). If an import is already running, subsequent requests skip.
@@ -957,7 +1009,11 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
                         {
                             try
                             {
-                                await RunImportPipelineAsync(importOpts, tracker, CancellationToken.None);
+                                await RunImportPipelineAsync(importOpts, tracker, backgroundImportCts.Token);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                Log.Warning("[server] Import (Configure+backfill) was cancelled on shutdown.");
                             }
                             catch (Exception ex)
                             {
@@ -1047,7 +1103,11 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
                     ApiKey     = currentApiKey,
                     NoConfirm  = true,
                 };
-                await RunImportPipelineAsync(importOpts, tracker, CancellationToken.None);
+                await RunImportPipelineAsync(importOpts, tracker, backgroundImportCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Log.Warning("[server] Import triggered by HQ notification was cancelled on shutdown.");
             }
             catch (Exception ex)
             {

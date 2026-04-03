@@ -84,7 +84,22 @@ public sealed class NotificationService : BackgroundService
         await foreach (var msg in nats.SubscribeAsync<byte[]>(subject, cancellationToken: stoppingToken))
         {
             // Fire-and-forget each command so the subscription loop is never blocked.
-            _ = Task.Run(() => HandleCommandAsync(msg, stoppingToken), stoppingToken);
+            // A per-handler timeout prevents a stuck handler from leaking indefinitely.
+            _ = Task.Run(async () =>
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                cts.CancelAfter(TimeSpan.FromMinutes(5));
+                try
+                {
+                    await HandleCommandAsync(msg, cts.Token);
+                }
+                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+                {
+                    var parts  = msg.Subject.Split('.');
+                    var action = parts.Length >= 4 ? parts[3] : "unknown";
+                    _logger.LogWarning("Notification handler '{Action}' timed out after 5 minutes.", action);
+                }
+            }, stoppingToken);
         }
     }
 
@@ -148,7 +163,16 @@ public sealed class NotificationService : BackgroundService
                 case "upgrade":
                     var version = GetString(payload, "version");
                     if (version is not null && _handlers.Upgrade is not null)
-                        await _handlers.Upgrade(version);
+                    {
+                        var result = await _handlers.Upgrade(version);
+                        await PublishResponseAsync(action, new GenericNotificationResponse
+                        {
+                            Success   = result.Success,
+                            Message   = result.Error,
+                            SessionId = _sessionId,
+                            Action    = action
+                        }, ct);
+                    }
                     break;
 
                 case "sendlogs":

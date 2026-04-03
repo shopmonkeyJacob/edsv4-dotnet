@@ -289,7 +289,10 @@ public static class SessionService
                 if (proc is not null)
                 {
                     var output = proc.StandardOutput.ReadToEnd();
-                    proc.WaitForExit();
+                    if (!proc.WaitForExit(5_000))
+                    {
+                        try { proc.Kill(); } catch { /* best-effort */ }
+                    }
                     var match = Regex.Match(output,
                         @"IOPlatformUUID""\s*=\s*""([^""]+)""");
                     if (match.Success) return match.Groups[1].Value;
@@ -367,6 +370,64 @@ public static class SessionService
             Log.Error(ex, "[sendlogs] Failed to upload logs to HQ.");
             return (false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Sends a lightweight heartbeat to the Shopmonkey API to confirm the session
+    /// is still alive and to surface current runtime stats (version, paused state).
+    /// </summary>
+    public static async Task SendHeartbeatAsync(
+        string apiUrl,
+        string apiKey,
+        string sessionId,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            http.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            http.DefaultRequestHeaders.UserAgent.ParseAdd(
+                $"Shopmonkey EDS Server/{EdsVersion.Current}");
+
+            var body     = JsonSerializer.Serialize(new { version = EdsVersion.Current });
+            await http.PostAsync(
+                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/heartbeat",
+                new StringContent(body, Encoding.UTF8, "application/json"),
+                ct);
+            // Heartbeat is best-effort — ignore non-success responses silently.
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log.Debug("[heartbeat] Failed: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Reads the NATS credential file and returns its expiry time,
+    /// or <see cref="DateTimeOffset.MaxValue"/> if the expiry cannot be determined.
+    /// </summary>
+    public static DateTimeOffset GetCredentialExpiry(string credsFile)
+    {
+        try
+        {
+            var content  = File.ReadAllText(credsFile);
+            var jwtMatch = Regex.Match(content,
+                @"-----BEGIN NATS USER JWT-----\s*(.+?)\s*-+END NATS USER JWT-+",
+                RegexOptions.Singleline);
+            if (!jwtMatch.Success) return DateTimeOffset.MaxValue;
+
+            var parts = jwtMatch.Groups[1].Value.Trim().Split('.');
+            if (parts.Length != 3) return DateTimeOffset.MaxValue;
+
+            using var doc = JsonDocument.Parse(Base64UrlDecode(parts[1]));
+            if (!doc.RootElement.TryGetProperty("nats", out var natsProp)
+                || !natsProp.TryGetProperty("exp", out var expProp))
+                return DateTimeOffset.MaxValue;
+
+            return DateTimeOffset.FromUnixTimeSeconds(expProp.GetInt64());
+        }
+        catch { return DateTimeOffset.MaxValue; }
     }
 
     internal static string MaskUrl(string url)

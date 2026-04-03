@@ -35,11 +35,16 @@ internal static class ConfigFileHelper
         if (!written)
             lines.Add($"{key} = \"{value}\"");
 
-        await File.WriteAllTextAsync(configPath, string.Join('\n', lines));
+        // Write atomically: write to a temp file, then rename over the target.
+        // Avoids a corrupt config if the process is killed mid-write.
+        var tempPath = configPath + ".tmp";
+        await File.WriteAllTextAsync(tempPath, string.Join('\n', lines));
 
         // Restrict to owner read/write on Unix — the file may contain the API token.
         if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(configPath,
+            File.SetUnixFileMode(tempPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        File.Move(tempPath, configPath, overwrite: true);
     }
 }
