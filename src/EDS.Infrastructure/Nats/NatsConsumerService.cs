@@ -70,6 +70,7 @@ public sealed class NatsConsumerService : BackgroundService
     private readonly ConsumerConfig _config;
     private readonly IDriver _driver;
     private readonly ILogger<NatsConsumerService> _logger;
+    private readonly EDS.Infrastructure.Metrics.StatusProvider? _status;
     private readonly DateTime _started = DateTime.UtcNow;
     private long _offset;
     private bool _paused;
@@ -78,11 +79,13 @@ public sealed class NatsConsumerService : BackgroundService
     public NatsConsumerService(
         ConsumerConfig config,
         IDriver driver,
-        ILogger<NatsConsumerService> logger)
+        ILogger<NatsConsumerService> logger,
+        EDS.Infrastructure.Metrics.StatusProvider? status = null)
     {
         _config = config;
         _driver = driver;
         _logger = logger;
+        _status = status;
     }
 
     /// <summary>
@@ -93,6 +96,7 @@ public sealed class NatsConsumerService : BackgroundService
     public void SetPaused(bool paused)
     {
         _paused = paused;
+        _status?.SetPaused(paused);
         _logger.LogInformation("[consumer] {Action} by HQ notification.", paused ? "Paused" : "Resumed");
     }
 
@@ -388,6 +392,8 @@ public sealed class NatsConsumerService : BackgroundService
                     EdsMetrics.PendingEvents.Inc();
                     pending.Add((evt, natsMsg));
                     pendingStarted ??= DateTimeOffset.UtcNow;
+                    _status?.RecordLastEvent(evt.Table);
+                    _status?.SetPendingFlush(pending.Count);
 
                     bool shouldFlushNow = await _driver.ProcessAsync(_logger, evt, ct);
 
@@ -458,6 +464,8 @@ public sealed class NatsConsumerService : BackgroundService
                 EdsMetrics.FlushCount.Observe(pending.Count);
                 EdsMetrics.TotalEvents.Inc(pending.Count);
                 EdsMetrics.PendingEvents.Dec(pending.Count);
+                _status?.RecordFlush(pending.Count);
+                _status?.SetPendingFlush(0);
 
                 foreach (var (_, msg) in pending)
                     await msg.AckAsync(cancellationToken: ct);

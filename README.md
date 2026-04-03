@@ -128,6 +128,39 @@ url       = "postgres://user:password@localhost:5432/mydb"
 
 Environment variables prefixed with `EDS_` override any value in `config.toml` (e.g. `EDS_TOKEN`, `EDS_URL`).
 
+## Metrics & Status
+
+EDS exposes an HTTP server on port **8080** (configurable via `metrics.port` in `config.toml` or the `[metrics]` section). Two endpoints are available from anywhere on the network:
+
+| Endpoint   | Format     | Description                              |
+|------------|------------|------------------------------------------|
+| `/metrics` | Prometheus | Counters, histograms, and gauges for scraping by Prometheus/Grafana |
+| `/status`  | JSON       | Human-readable runtime snapshot          |
+
+### `/status` response
+
+```json
+{
+  "version": "1.2.3",
+  "session_id": "abc123def456",
+  "driver": "postgres://localhost:5432/mydb",
+  "uptime_seconds": 3847,
+  "paused": false,
+  "last_event_at": "2026-04-03T14:22:10+00:00",
+  "last_event_table": "work_orders",
+  "events_processed": 184920,
+  "pending_flush": 3
+}
+```
+
+### Configuring the metrics port
+
+```toml
+[metrics]
+port = 9090   # default: 8080
+host = "+"    # "+" = all interfaces, "localhost" = loopback only
+```
+
 ## Architecture
 
 ```

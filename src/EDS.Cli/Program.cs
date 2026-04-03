@@ -245,6 +245,7 @@ static async Task RunServerAsync(
         .ConfigureServices((ctx, svc) =>
         {
             svc.Configure<MetricsOptions>(ctx.Configuration.GetSection("metrics"));
+            svc.AddSingleton<EDS.Infrastructure.Metrics.StatusProvider>();
             svc.AddHostedService<MetricsServer>();
             svc.AddSingleton(registry);
             svc.AddSingleton<EDS.Infrastructure.Tracking.SqliteTracker>(_ => tracker);
@@ -294,6 +295,12 @@ static async Task RunServerAsync(
         }).Build();
 
     var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+
+    // ── Populate status provider ──────────────────────────────────────────────
+    var statusProvider = host.Services.GetRequiredService<EDS.Infrastructure.Metrics.StatusProvider>();
+    statusProvider.Version   = EdsVersion.Current;
+    statusProvider.SessionId = sessionId;
+    statusProvider.Driver    = EDS.Infrastructure.Metrics.StatusProvider.SanitizeUrl(driverUrl);
 
     // ── Wire handlers that need host services ─────────────────────────────────
     // NotificationHandlers is a class (reference type), so mutating it here is
