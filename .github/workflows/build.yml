@@ -50,11 +50,11 @@ jobs:
       matrix:
         include:
           - rid: osx-arm64
-            artifact: EDS.Cli-osx-arm64
+            archive: eds-osx-arm64.tar.gz
           - rid: linux-x64
-            artifact: EDS.Cli-linux-x64
+            archive: eds-linux-x64.tar.gz
           - rid: win-x64
-            artifact: EDS.Cli-win-x64.exe
+            archive: eds-win-x64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -67,25 +67,29 @@ jobs:
       - name: Publish ${{ matrix.rid }}
         run: |
           VERSION="${{ github.ref_name }}"
-          # Strip leading 'v' so dotnet gets a plain semver (e.g. 0.4.0-alpha)
+          # Strip leading 'v' so dotnet gets a plain semver (e.g. 0.8.0-beta)
           VERSION="${VERSION#v}"
           dotnet publish src/EDS.Cli \
             -r ${{ matrix.rid }} \
             -o publish/${{ matrix.rid }} \
             -p:Version="${VERSION}"
 
-      - name: Rename binary
+      - name: Package binary
         run: |
-          SRC="publish/${{ matrix.rid }}/EDS.Cli"
-          # Windows publish produces EDS.Cli.exe; others produce EDS.Cli
-          if [ -f "${SRC}.exe" ]; then SRC="${SRC}.exe"; fi
-          cp "${SRC}" "${{ matrix.artifact }}"
+          OUT="publish/${{ matrix.rid }}"
+          if [ "${{ matrix.rid }}" = "win-x64" ]; then
+            # zip preserves nothing on Windows — fine, .exe has no execute concept
+            cd "$OUT" && zip -j "../../${{ matrix.archive }}" EDS.Cli.exe
+          else
+            # tar.gz preserves the execute bit set by dotnet publish
+            cd "$OUT" && tar czf "../../${{ matrix.archive }}" EDS.Cli
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
 
   # ── GitHub Release (version tags only) ───────────────────────────────────────
