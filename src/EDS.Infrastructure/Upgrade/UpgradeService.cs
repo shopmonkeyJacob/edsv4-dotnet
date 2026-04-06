@@ -1,4 +1,5 @@
 using EDS.Core.Utilities;
+using TarFormats = System.Formats.Tar;
 using Microsoft.Extensions.Logging;
 using PgpCore;
 using System.IO.Compression;
@@ -17,6 +18,13 @@ public sealed class UpgradeConfig
 /// <summary>
 /// Securely downloads, PGP-verifies, and installs a new EDS binary.
 /// Mirrors the Go upgrade.go implementation.
+///
+/// Security properties:
+/// - PGP signature is verified before any bytes are written to the destination path.
+/// - The verified archive bytes are extracted directly from the in-memory buffer that
+///   was verified, eliminating the TOCTOU window between verify and extract.
+/// - TAR extraction uses System.Formats.Tar (replaces hand-rolled parser) to handle
+///   path traversal and symlink entries safely.
 /// </summary>
 public sealed class UpgradeService
 {
@@ -31,90 +39,81 @@ public sealed class UpgradeService
 
     public async Task UpgradeAsync(UpgradeConfig config, CancellationToken ct = default)
     {
-        var tmpBinary = Path.GetTempFileName();
-        var tmpSig = Path.GetTempFileName();
-        try
+        _logger.LogInformation("Downloading new binary from {Url}", config.BinaryUrl);
+        var archiveBytes = await DownloadBytesAsync(config.BinaryUrl, ct);
+
+        _logger.LogInformation("Downloading signature from {Url}", config.SignatureUrl);
+        var sigBytes = await DownloadBytesAsync(config.SignatureUrl, ct);
+
+        // Verify the PGP signature against the downloaded archive bytes.
+        // Both buffers are in memory — no temp files, no TOCTOU window.
+        _logger.LogInformation("Verifying PGP signature...");
+        await VerifySignatureAsync(archiveBytes, sigBytes, config.PublicKey);
+
+        // Extract from the verified in-memory buffer — same bytes that were verified.
+        _logger.LogInformation("Extracting binary to {Dest}", config.DestinationPath);
+        ExtractBinary(archiveBytes, config.DestinationPath);
+
+        // Make executable on Unix
+        if (!OperatingSystem.IsWindows())
         {
-            _logger.LogInformation("Downloading new binary from {Url}", config.BinaryUrl);
-            await DownloadFileAsync(config.BinaryUrl, tmpBinary, ct);
-
-            _logger.LogInformation("Downloading signature from {Url}", config.SignatureUrl);
-            await DownloadFileAsync(config.SignatureUrl, tmpSig, ct);
-
-            _logger.LogInformation("Verifying PGP signature...");
-            await VerifySignatureAsync(tmpBinary, tmpSig, config.PublicKey, ct);
-
-            _logger.LogInformation("Extracting binary to {Dest}", config.DestinationPath);
-            ExtractBinary(tmpBinary, config.DestinationPath);
-
-            // Make executable on Unix
-            if (!OperatingSystem.IsWindows())
-            {
-                File.SetUnixFileMode(config.DestinationPath,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
-                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-            }
-
-            _logger.LogInformation("Upgrade complete. Restart to use the new version.");
+            File.SetUnixFileMode(config.DestinationPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
         }
-        catch
-        {
-            // Clean up temp files on failure
-            TryDelete(tmpBinary);
-            TryDelete(tmpSig);
-            throw;
-        }
+
+        _logger.LogInformation("Upgrade complete. Restart to use the new version.");
     }
 
-    private async Task DownloadFileAsync(string url, string destination, CancellationToken ct)
+    private async Task<byte[]> DownloadBytesAsync(string url, CancellationToken ct)
     {
         using var response = await RetryHelper.ExecuteAsync(
             innerCt => _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, innerCt),
             _logger, operationName: $"download {Path.GetFileName(url)}", ct: ct);
         response.EnsureSuccessStatusCode();
-
-        await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        await using var file = File.Create(destination);
-        await stream.CopyToAsync(file, ct);
+        return await response.Content.ReadAsByteArrayAsync(ct);
     }
 
     private static async Task VerifySignatureAsync(
-        string filePath,
-        string sigPath,
-        string armoredPublicKey,
-        CancellationToken ct)
+        byte[] archiveBytes,
+        byte[] sigBytes,
+        string armoredPublicKey)
     {
         var encryptionKeys = new EncryptionKeys(armoredPublicKey);
         using var pgp = new PGP(encryptionKeys);
-        await using var sigStream = File.OpenRead(sigPath);
-        bool valid = await pgp.VerifyStreamAsync(sigStream, throwIfEncrypted: false);
+
+        using var dataStream = new MemoryStream(archiveBytes);
+        using var sigStream  = new MemoryStream(sigBytes);
+
+        // VerifyAsync with two streams verifies a detached PGP signature:
+        // confirms that sigBytes is a valid signature of archiveBytes by the public key.
+        bool valid = await pgp.VerifyAsync(dataStream, sigStream);
         if (!valid)
             throw new SecurityException("PGP signature verification failed. The binary may have been tampered with.");
     }
 
-    private static void ExtractBinary(string archivePath, string destination)
+    private static void ExtractBinary(byte[] archiveBytes, string destination)
     {
         // Detect archive type by magic bytes
-        using var fs = File.OpenRead(archivePath);
-        Span<byte> magic = stackalloc byte[4];
-        fs.Read(magic);
-        fs.Seek(0, SeekOrigin.Begin);
+        if (archiveBytes.Length < 2)
+            throw new InvalidDataException("Archive is too small to be a valid binary.");
 
-        if (magic[0] == 0x50 && magic[1] == 0x4B) // PK → ZIP
+        using var ms = new MemoryStream(archiveBytes);
+
+        if (archiveBytes[0] == 0x50 && archiveBytes[1] == 0x4B) // PK → ZIP
         {
-            ExtractFromZip(fs, destination);
+            ExtractFromZip(ms, destination);
         }
-        else if (magic[0] == 0x1F && magic[1] == 0x8B) // gzip magic
+        else if (archiveBytes[0] == 0x1F && archiveBytes[1] == 0x8B) // gzip → tar.gz
         {
-            ExtractFromTarGz(fs, destination);
+            ExtractFromTarGz(ms, destination);
         }
         else
         {
-            // Plain binary
-            fs.Seek(0, SeekOrigin.Begin);
+            // Plain binary — write directly
             using var dest = File.Create(destination);
-            fs.CopyTo(dest);
+            ms.CopyTo(dest);
         }
     }
 
@@ -126,6 +125,13 @@ public sealed class UpgradeService
             e.Name.Equals("eds", StringComparison.OrdinalIgnoreCase))
             ?? zip.Entries.First();
 
+        // Guard against zip-slip: entry.FullName must not escape destination directory.
+        var destDir    = Path.GetDirectoryName(destination)!;
+        var entryPath  = Path.GetFullPath(Path.Combine(destDir, entry.FullName));
+        if (!entryPath.StartsWith(Path.GetFullPath(destDir) + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            && entryPath != Path.GetFullPath(destination))
+            throw new InvalidOperationException($"Zip entry '{entry.FullName}' would escape destination directory.");
+
         using var entryStream = entry.Open();
         using var dest = File.Create(destination);
         entryStream.CopyTo(dest);
@@ -133,44 +139,38 @@ public sealed class UpgradeService
 
     private static void ExtractFromTarGz(Stream source, string destination)
     {
-        using var gz = new GZipStream(source, CompressionMode.Decompress);
-        // Minimal TAR reader — skip 512-byte header blocks
-        var header = new byte[512];
-        using var dest = File.Create(destination);
+        using var gz     = new GZipStream(source, CompressionMode.Decompress);
+        using var reader = new TarFormats.TarReader(gz, leaveOpen: false);
 
-        while (gz.Read(header, 0, 512) == 512)
+        while (reader.GetNextEntry() is { } entry)
         {
-            if (header[0] == 0) break; // end of archive
+            // Only extract regular files — skip symlinks, hardlinks, directories.
+            if (entry.EntryType != TarFormats.TarEntryType.RegularFile
+                && entry.EntryType != TarFormats.TarEntryType.V7RegularFile)
+                continue;
 
-            var nameBytes = header.AsSpan(0, 100);
-            var name = System.Text.Encoding.ASCII.GetString(nameBytes).TrimEnd('\0');
-            var sizeStr = System.Text.Encoding.ASCII.GetString(header, 124, 12).TrimEnd('\0').Trim();
-            long size = sizeStr.Length > 0 ? Convert.ToInt64(sizeStr, 8) : 0;
+            var name = Path.GetFileName(entry.Name);
+            if (!name.Equals("eds", StringComparison.OrdinalIgnoreCase)
+                && !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                continue;
 
-            bool isTarget = Path.GetFileName(name).Equals("eds", StringComparison.OrdinalIgnoreCase)
-                || Path.GetFileName(name).EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
-
-            long remaining = size;
-            var buf = new byte[4096];
-            while (remaining > 0)
+            // Write to a temp file alongside the destination, then atomic-rename.
+            var tmp = destination + ".upgrade.tmp";
+            try
             {
-                int toRead = (int)Math.Min(buf.Length, remaining);
-                int read = gz.Read(buf, 0, toRead);
-                if (read == 0) break;
-                if (isTarget) dest.Write(buf, 0, read);
-                remaining -= read;
+                using var dest = File.Create(tmp);
+                entry.DataStream!.CopyTo(dest);
+                File.Move(tmp, destination, overwrite: true);
             }
-
-            // Skip to next 512-byte boundary
-            long padding = (512 - (size % 512)) % 512;
-            if (padding > 0)
+            catch
             {
-                var skip = new byte[padding];
-                gz.Read(skip, 0, (int)padding);
+                try { File.Delete(tmp); } catch { }
+                throw;
             }
-
-            if (isTarget) return; // found it
+            return;
         }
+
+        throw new InvalidDataException("No EDS binary found in the upgrade archive.");
     }
 
     private static void TryDelete(string path)

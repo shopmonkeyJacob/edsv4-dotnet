@@ -195,7 +195,9 @@ internal static class ImportService
                 await sem.WaitAsync(innerCt);
                 try
                 {
-                    var dest = Path.Combine(destDir, Path.GetFileName(uri.LocalPath));
+                    var dest = Path.GetFullPath(Path.Combine(destDir, Path.GetFileName(uri.LocalPath)));
+                    if (!dest.StartsWith(Path.GetFullPath(destDir) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                        throw new InvalidOperationException($"Download destination escaped target directory: {uri}");
                     using var http = new HttpClient();
                     using var r = await RetryHelper.ExecuteAsync(
                         ct2 => http.GetAsync(uri, ct2),

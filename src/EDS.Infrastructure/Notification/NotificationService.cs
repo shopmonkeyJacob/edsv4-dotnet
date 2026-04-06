@@ -81,10 +81,25 @@ public sealed class NotificationService : BackgroundService
         var subject = $"eds.notify.{_sessionId}.>";
         _logger.LogInformation("Listening for notifications on {Subject}", subject);
 
+        // Cap concurrent notification handlers to prevent task fan-out DoS.
+        using var handlerSem = new SemaphoreSlim(8, 8);
+
         await foreach (var msg in nats.SubscribeAsync<byte[]>(subject, cancellationToken: stoppingToken))
         {
+            // Reject oversized payloads before any deserialization (DoS guard).
+            const int MaxPayloadBytes = 1 * 1024 * 1024; // 1 MB
+            if (msg.Data?.Length > MaxPayloadBytes)
+            {
+                var parts2 = msg.Subject.Split('.');
+                var action2 = parts2.Length >= 4 ? parts2[3] : "unknown";
+                _logger.LogWarning("Dropping oversized notification '{Action}' ({Bytes} bytes > {Max} byte limit).",
+                    action2, msg.Data.Length, MaxPayloadBytes);
+                continue;
+            }
+
             // Fire-and-forget each command so the subscription loop is never blocked.
             // A per-handler timeout prevents a stuck handler from leaking indefinitely.
+            await handlerSem.WaitAsync(stoppingToken);
             _ = Task.Run(async () =>
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -98,6 +113,10 @@ public sealed class NotificationService : BackgroundService
                     var parts  = msg.Subject.Split('.');
                     var action = parts.Length >= 4 ? parts[3] : "unknown";
                     _logger.LogWarning("Notification handler '{Action}' timed out after 5 minutes.", action);
+                }
+                finally
+                {
+                    handlerSem.Release();
                 }
             }, stoppingToken);
         }

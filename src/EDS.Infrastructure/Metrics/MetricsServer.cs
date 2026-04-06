@@ -10,7 +10,12 @@ namespace EDS.Infrastructure.Metrics;
 public sealed class MetricsOptions
 {
     public int Port { get; set; } = 8080;
-    public string Host { get; set; } = "+";
+    /// <summary>
+    /// Host binding for the metrics/status HTTP server.
+    /// Default "localhost" restricts to loopback only — set to "+" to expose on all interfaces
+    /// (required for Docker/Kubernetes scraping). Configure via metrics.host in config.toml.
+    /// </summary>
+    public string Host { get; set; } = "localhost";
 }
 
 /// <summary>

@@ -337,6 +337,12 @@ static async Task RunServerAsync(
         Log.Information("[server] Upgrade to version {Version} requested from HQ.", version);
         try
         {
+            // Validate version string before embedding in URL to prevent path traversal.
+            // Acceptable: "1.2.3", "1.2.3-rc", "0.9.0-beta.1", etc.
+            if (!System.Text.RegularExpressions.Regex.IsMatch(version, @"^[\w.\-]+$")
+                || version.Contains(".."))
+                throw new ArgumentException($"Invalid version string: '{version}'.");
+
             var platform    = GetPlatformId();
             var currentExe  = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
                 ?? throw new InvalidOperationException("Cannot determine current executable path.");

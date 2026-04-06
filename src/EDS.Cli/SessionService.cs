@@ -173,8 +173,17 @@ public static class SessionService
         var credential = data.GetProperty("credential").GetString()
             ?? throw new InvalidOperationException("No credential in session start response.");
 
+        // Validate sessionId format before using in path construction to prevent traversal.
+        if (!System.Text.RegularExpressions.Regex.IsMatch(sessionId, @"^[a-f0-9\-]+$"))
+            throw new InvalidOperationException($"Received invalid session ID format from API: '{sessionId}'.");
+
         // Decode base64 NATS credential and write to disk
         var sessionDir = Path.Combine(dataDir, sessionId);
+        // Confirm the resolved path is still inside dataDir (defense in depth).
+        var canonicalSession = Path.GetFullPath(sessionDir);
+        var canonicalData    = Path.GetFullPath(dataDir);
+        if (!canonicalSession.StartsWith(canonicalData + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidOperationException("Session directory path escaped data directory.");
         Directory.CreateDirectory(sessionDir);
         var credsFile  = Path.Combine(sessionDir, "nats.creds");
         await File.WriteAllBytesAsync(credsFile, Convert.FromBase64String(credential), ct);

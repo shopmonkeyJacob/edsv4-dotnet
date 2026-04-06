@@ -102,6 +102,46 @@ Because rows are written via MERGE/upsert, any file that was only partially proc
 
 ## Driver Connection Strings
 
+### PostgreSQL (`postgres`)
+
+```
+postgres://user:password@host:5432/dbname
+postgres://user:password@host:5432/dbname?sslmode=require
+```
+
+### MySQL / MariaDB (`mysql`)
+
+```
+mysql://user:password@host:3306/dbname
+mysql://user:password@host:3306/dbname?tls=true
+```
+
+### SQL Server (`sqlserver`)
+
+```
+sqlserver://user:password@host:1433?database=dbname
+sqlserver://user:password@host:1433?database=dbname&trust-server-certificate=false
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `trust-server-certificate` | `true` | Set to `false` to enforce TLS certificate validation (recommended for production) |
+
+### Snowflake (`snowflake`)
+
+```
+snowflake://user:password@account/dbname/schema?warehouse=WH&role=ROLE
+```
+
+### Amazon S3 (`s3`)
+
+```
+s3://bucket-name/optional-prefix?region=us-east-1
+s3://bucket-name/optional-prefix?region=us-east-1&access-key=KEY&secret-key=SECRET
+```
+
+Credentials fall back to the AWS credential chain (environment variables, `~/.aws/credentials`, instance metadata) when `access-key` and `secret-key` are not provided.
+
 ### Azure Blob Storage (`azureblob`)
 
 | Auth method       | URL format |
@@ -121,9 +161,9 @@ dotnet build
 
 # Publish self-contained binaries (always pass -p:Version so the version
 # string is stamped into the binary and reported to Shopmonkey HQ)
-dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64  -p:Version=0.4.0-alpha
-dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64  -p:Version=0.4.0-alpha
-dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64    -p:Version=0.4.0-alpha
+dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64  -p:Version=0.9.1-rc
+dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64  -p:Version=0.9.1-rc
+dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64    -p:Version=0.9.1-rc
 ```
 
 Without `-p:Version`, the binary reports version `dev` to HQ. The CI/CD pipeline sets this
@@ -198,7 +238,7 @@ Environment variables prefixed with `EDS_` override any value in `config.toml` (
 
 ## Metrics & Status
 
-EDS exposes an HTTP server on port **8080** (configurable via `metrics.port` in `config.toml` or the `[metrics]` section). Two endpoints are available from anywhere on the network:
+EDS exposes an HTTP server on port **8080** (configurable via `metrics.port` in `config.toml` or the `[metrics]` section). By default the server binds to `localhost` only. Two endpoints are available:
 
 | Endpoint   | Format     | Description                              |
 |------------|------------|------------------------------------------|
@@ -223,10 +263,26 @@ EDS exposes an HTTP server on port **8080** (configurable via `metrics.port` in 
 
 ### Configuring the metrics port
 
+By default the metrics server binds to `localhost` only. Set `host = "+"` to expose on all interfaces when running inside Docker or Kubernetes where a Prometheus scraper reaches the container from outside loopback.
+
 ```toml
 [metrics]
 port = 9090   # default: 8080
-host = "+"    # "+" = all interfaces, "localhost" = loopback only
+host = "+"    # "+" = all interfaces (needed for Docker/k8s); default is "localhost"
+```
+
+## Session Renewal
+
+EDS automatically restarts every 24 hours to obtain a fresh session and NATS credentials from Shopmonkey HQ. The restart is clean — all in-flight events are acknowledged before shutdown. If you are running EDS under a process supervisor (systemd, Docker, etc.), configure it to restart on any exit code.
+
+## Exit Codes
+
+| Code | Meaning | Recommended supervisor action |
+|------|---------|-------------------------------|
+| `0` | Clean shutdown | Do not restart |
+| `1` | Fatal error | Restart with backoff |
+| `4` | Intentional restart (session renewal, HQ-initiated restart, successful upgrade) | Restart immediately |
+| `5` | NATS connectivity lost | Restart with backoff |
 ```
 
 ## Architecture
