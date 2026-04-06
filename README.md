@@ -283,6 +283,16 @@ EDS automatically restarts every 24 hours to obtain a fresh session and NATS cre
 | `1` | Fatal error | Restart with backoff |
 | `4` | Intentional restart (session renewal, HQ-initiated restart, successful upgrade) | Restart immediately |
 | `5` | NATS connectivity lost | Restart with backoff |
+
+### systemd example
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/eds server
+Restart=always
+RestartSec=5
+# Restart immediately (no delay) for intentional restart and NATS disconnect
+RestartForceExitStatus=4 5
 ```
 
 ## Architecture
