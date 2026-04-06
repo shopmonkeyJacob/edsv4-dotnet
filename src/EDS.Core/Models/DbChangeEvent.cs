@@ -93,7 +93,10 @@ public sealed class DbChangeEvent
             return Key[^1];
 
         var obj = GetObject();
-        if (obj is not null && obj.TryGetValue("id", out var id) && id is string idStr)
+        if (obj is not null && obj.TryGetValue("id", out var id)
+            && id is System.Text.Json.JsonElement el
+            && el.ValueKind == System.Text.Json.JsonValueKind.String
+            && el.GetString() is string idStr)
             return idStr;
 
         return string.Empty;

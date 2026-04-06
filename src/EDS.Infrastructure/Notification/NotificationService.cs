@@ -297,7 +297,7 @@ public sealed class NotificationService : BackgroundService
 
     /// <summary>
     /// Decodes the raw NATS message body into a <see cref="NotificationPayload"/>.
-    /// Supports both JSON and msgpack (identified by the <c>content-encoding</c> header).
+    /// Supports both JSON and msgpack (identified by the <c>Content-Type</c> header).
     /// </summary>
     private static NotificationPayload ParsePayload(NatsMsg<byte[]> msg)
     {
@@ -307,8 +307,10 @@ public sealed class NotificationService : BackgroundService
         try
         {
             var isMsgPack = msg.Headers is not null
-                && msg.Headers.TryGetValue("content-encoding", out var enc)
+                && msg.Headers.TryGetValue("Content-Type", out var enc)
+#pragma warning disable CS8602
                 && enc.Any(e => e.Contains("msgpack", StringComparison.OrdinalIgnoreCase));
+#pragma warning restore CS8602
 
             string json = isMsgPack
                 ? MessagePackSerializer.ConvertToJson(data)

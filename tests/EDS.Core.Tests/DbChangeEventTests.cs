@@ -79,14 +79,13 @@ public class DbChangeEventTests
     }
 
     [Fact]
-    public void GetPrimaryKey_EmptyKeyWithAfter_ReturnsEmpty()
+    public void GetPrimaryKey_EmptyKeyWithAfter_ReturnsIdFromPayload()
     {
-        // GetObject() deserializes values as JsonElement (not string), so the
-        // `id is string` branch never matches. Empty key → empty primary key.
+        // When Key is empty, falls back to extracting "id" from the After payload.
         var after = ParseJson("""{"id": "json-id", "name": "test"}""");
         var evt = Insert(key: [], after: after);
 
-        Assert.Equal(string.Empty, evt.GetPrimaryKey());
+        Assert.Equal("json-id", evt.GetPrimaryKey());
     }
 
     // ── GetObject ─────────────────────────────────────────────────────────────

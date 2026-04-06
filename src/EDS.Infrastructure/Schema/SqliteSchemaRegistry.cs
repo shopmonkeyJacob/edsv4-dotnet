@@ -34,7 +34,7 @@ public sealed class SqliteSchemaRegistry : ISchemaRegistry
     /// Loads schema definitions from a directory of JSON files.
     /// Each file should be named {table}.json and contain a Schema object.
     /// </summary>
-    public static SchemaMap LoadSchemasFromDirectory(string directory)
+    public static SchemaMap LoadSchemasFromDirectory(string directory, ILogger? logger = null)
     {
         var map = new SchemaMap();
         if (!Directory.Exists(directory))
@@ -52,7 +52,7 @@ public sealed class SqliteSchemaRegistry : ISchemaRegistry
             catch (Exception ex)
             {
                 // Log and skip bad schema files
-                Console.Error.WriteLine($"Failed to load schema from {file}: {ex.Message}");
+                logger?.LogWarning(ex, "Failed to load schema from {File}", file);
             }
         }
         return map;

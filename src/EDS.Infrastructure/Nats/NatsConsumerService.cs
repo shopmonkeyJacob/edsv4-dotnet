@@ -1,3 +1,4 @@
+using EDS.Core;
 using EDS.Core.Abstractions;
 using EDS.Core.Models;
 using EDS.Infrastructure.Metrics;
@@ -173,7 +174,7 @@ public sealed class NatsConsumerService : BackgroundService
         var consumerTask = js.CreateOrUpdateConsumerAsync("dbchange", natsCfg, stoppingToken).AsTask();
 
         Task lifecycleTask = Task.CompletedTask;
-        if (_driver is IDriverLifecycle lifecycle)
+        if (_driver is IDriverLifecycle lifecycle && _config.DriverConfig is not null)
         {
             _logger.LogInformation("[consumer] Starting driver lifecycle.");
             lifecycleTask = lifecycle.StartAsync(_config.DriverConfig, stoppingToken);
@@ -196,7 +197,10 @@ public sealed class NatsConsumerService : BackgroundService
             _logger.LogCritical("[consumer] Fatal error in consumer fork. Session={SessionId} Uptime={Uptime}s.",
                 credInfo.SessionID,
                 (long)(DateTime.UtcNow - _started).TotalSeconds);
-            Environment.ExitCode = 1;
+            // Distinguish NATS connectivity loss (code 5) from other fatal errors (code 1).
+            Environment.ExitCode = IsNatsConnectivityError(ex)
+                ? EdsExitCodes.NatsDisconnected
+                : EdsExitCodes.FatalError;
             throw;
         }
         finally
@@ -282,7 +286,7 @@ public sealed class NatsConsumerService : BackgroundService
 
     private async Task RunProcessingLoopAsync(INatsJSConsumer consumer, CancellationToken ct)
     {
-        var pending   = new List<(DbChangeEvent evt, INatsJSMsg<byte[]> msg)>();
+        var pending   = new List<(DbChangeEvent evt, INatsJSMsg<byte[]> msg, long receivedMs)>();
         DateTimeOffset? pendingStarted = null;
         int batchSize = _driver.MaxBatchSize;
 
@@ -368,6 +372,8 @@ public sealed class NatsConsumerService : BackgroundService
                     _logger.LogDebug("[consumer] Dequeued message: subject={Subject} bytes={Bytes}",
                         natsMsg.Subject, natsMsg.Data?.Length ?? 0);
 
+                    var receivedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
                     DbChangeEvent evt;
                     try
                     {
@@ -379,6 +385,18 @@ public sealed class NatsConsumerService : BackgroundService
                     {
                         _logger.LogError(ex, "[consumer] Failed to decode NATS message.");
                         await natsMsg.NakAsync(cancellationToken: ct);
+                        continue;
+                    }
+
+                    // ── MVCC timestamp filter (mirrors Go shouldSkip) ─────────────────
+                    // After a bulk import, skip live events whose timestamp falls within
+                    // the already-imported window to prevent duplicate writes.
+                    if (_config.ExportTableTimestamps.TryGetValue(evt.Table, out var importCutoff)
+                        && evt.Timestamp <= importCutoff.ToUnixTimeMilliseconds())
+                    {
+                        _logger.LogDebug("[consumer] Skipping {Op} {Table} id={Id} (ts={Ts}ms) — within import window (cutoff={Cutoff}ms).",
+                            evt.Operation, evt.Table, evt.Id, evt.Timestamp, importCutoff.ToUnixTimeMilliseconds());
+                        await natsMsg.AckAsync(cancellationToken: ct);
                         continue;
                     }
 
@@ -401,7 +419,7 @@ public sealed class NatsConsumerService : BackgroundService
                     }
 
                     EdsMetrics.PendingEvents.Inc();
-                    pending.Add((evt, natsMsg));
+                    pending.Add((evt, natsMsg, receivedMs));
                     pendingStarted ??= DateTimeOffset.UtcNow;
                     _status?.RecordLastEvent(evt.Table);
                     _status?.SetPendingFlush(pending.Count);
@@ -451,7 +469,7 @@ public sealed class NatsConsumerService : BackgroundService
     private const int MaxFlushAttempts = 5;
 
     private async Task FlushAndAckAsync(
-        List<(DbChangeEvent evt, INatsJSMsg<byte[]> msg)> pending,
+        List<(DbChangeEvent evt, INatsJSMsg<byte[]> msg, long receivedMs)> pending,
         CancellationToken ct)
     {
         _logger.LogInformation("[consumer] Flushing {Count} event(s) to driver.", pending.Count);
@@ -468,6 +486,7 @@ public sealed class NatsConsumerService : BackgroundService
                 await _driver.FlushAsync(_logger, ct);
                 sw.Stop();
 
+                var ackedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _logger.LogInformation("[consumer] Flush completed in {Ms}ms — {Count} event(s) ACKed.",
                     sw.ElapsedMilliseconds, pending.Count);
 
@@ -478,8 +497,12 @@ public sealed class NatsConsumerService : BackgroundService
                 _status?.RecordFlush(pending.Count);
                 _status?.SetPendingFlush(0);
 
-                foreach (var (_, msg) in pending)
+                foreach (var (_, msg, receivedMs) in pending)
+                {
+                    // Record E2E processing duration: time from receive to ACK (mirrors Go processingDuration).
+                    EdsMetrics.ProcessingDurationSeconds.Observe((ackedAtMs - receivedMs) / 1000.0);
                     await msg.AckAsync(cancellationToken: ct);
+                }
 
                 pending.Clear();
                 return;
@@ -488,7 +511,7 @@ public sealed class NatsConsumerService : BackgroundService
             {
                 // Graceful shutdown — NAK without counting as a failure.
                 _logger.LogInformation("[consumer] Flush cancelled during shutdown — NAKing {Count} message(s).", pending.Count);
-                foreach (var (_, msg) in pending)
+                foreach (var (_, msg, _) in pending)
                 {
                     try { await msg.NakAsync(cancellationToken: CancellationToken.None); } catch { }
                 }
@@ -509,7 +532,7 @@ public sealed class NatsConsumerService : BackgroundService
 
                     // FlushAsync always clears its internal buffer on failure; re-queue the events
                     // so the next attempt has data to commit.
-                    foreach (var (evt, _) in pending)
+                    foreach (var (evt, _, _) in pending)
                     {
                         try { await _driver.ProcessAsync(_logger, evt, ct); }
                         catch (Exception requeueEx)
@@ -529,14 +552,14 @@ public sealed class NatsConsumerService : BackgroundService
             MaxFlushAttempts, pending.Count);
         _logger.LogCritical("[consumer] Unrecoverable flush error. Process will exit with a failing status code.");
 
-        foreach (var (_, msg) in pending)
+        foreach (var (_, msg, _) in pending)
         {
             try { await msg.NakAsync(cancellationToken: CancellationToken.None); } catch { }
         }
         pending.Clear();
 
         // Signal a non-zero exit code so the process manager (systemd, Docker, etc.) will restart us.
-        Environment.ExitCode = 1;
+        Environment.ExitCode = EdsExitCodes.FatalError;
         throw lastEx!;
     }
 
@@ -596,14 +619,18 @@ public sealed class NatsConsumerService : BackgroundService
 
         if (msg.Headers != null
             && msg.Headers.TryGetValue("Content-Encoding", out var encodings)
+#pragma warning disable CS8602
             && encodings.Any(e => e.Contains("gzip", StringComparison.OrdinalIgnoreCase)))
+#pragma warning restore CS8602
         {
             payload = await DecompressGzipAsync(payload, ct);
         }
 
         bool isMsgPack = msg.Headers != null
             && msg.Headers.TryGetValue("Content-Type", out var contentTypes)
+#pragma warning disable CS8602
             && contentTypes.Any(ct2 => ct2.Contains("msgpack", StringComparison.OrdinalIgnoreCase));
+#pragma warning restore CS8602
 
         if (isMsgPack)
             return MessagePackSerializer.Deserialize<DbChangeEvent>(payload);
@@ -763,4 +790,13 @@ public sealed class NatsConsumerService : BackgroundService
 
         return new HeartbeatLoad();
     }
+
+    /// <summary>
+    /// Returns true if the exception represents a NATS connectivity failure (exit code 5),
+    /// as opposed to a driver or application error (exit code 1).
+    /// </summary>
+    private static bool IsNatsConnectivityError(Exception ex) =>
+        ex is NATS.Client.Core.NatsException
+           || ex.GetType().FullName?.StartsWith("NATS.", StringComparison.Ordinal) == true
+           || ex.Message.Contains("NATS", StringComparison.OrdinalIgnoreCase);
 }

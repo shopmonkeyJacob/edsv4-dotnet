@@ -1,3 +1,4 @@
+using EDS.Core;
 using EDS.Core.Registry;
 using EDS.Drivers.AzureBlob;
 using EDS.Drivers.EventHub;
@@ -61,15 +62,23 @@ static RootCommand BuildRootCommand()
 
 static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt, Option<string> ddOpt)
 {
+    var renewIntervalOption = new Option<TimeSpan?>("--renew-interval")
+    {
+        Description = "Interval at which the server stops itself so the process manager can restart it with a fresh session (default: 24h).",
+        Hidden      = true,
+    };
+
     var cmd = new Command("server") { Description = "Start the EDS streaming server." };
     cmd.Options.Add(cfgOpt);
     cmd.Options.Add(verbOpt);
     cmd.Options.Add(ddOpt);
+    cmd.Options.Add(renewIntervalOption);
     cmd.SetAction(async (parseResult, ct) =>
     {
-        var cfg     = parseResult.GetValue(cfgOpt);
-        var verbose = parseResult.GetValue(verbOpt);
-        var dataDir = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
+        var cfg            = parseResult.GetValue(cfgOpt);
+        var verbose        = parseResult.GetValue(verbOpt);
+        var dataDir        = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
+        var renewInterval  = parseResult.GetValue(renewIntervalOption) ?? TimeSpan.FromHours(24);
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
@@ -128,7 +137,7 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
             }
         }
 
-        await RunServerAsync(configPath, dataDir, verbose, tracker, ct);
+        await RunServerAsync(configPath, dataDir, verbose, renewInterval, tracker, ct);
     });
     return cmd;
 }
@@ -141,6 +150,7 @@ static async Task RunServerAsync(
     string configPath,
     string dataDir,
     bool verbose,
+    TimeSpan renewInterval,
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
     CancellationToken ct)
 {
@@ -317,6 +327,7 @@ static async Task RunServerAsync(
     handlers.Restart = () =>
     {
         Log.Information("[server] Restart requested from HQ. Stopping — process manager should restart.");
+        Environment.ExitCode = EdsExitCodes.IntentionalRestart;
         lifetime.StopApplication();
         return Task.CompletedTask;
     };
@@ -344,6 +355,7 @@ static async Task RunServerAsync(
                 upgradeLogger, new HttpClient { Timeout = TimeSpan.FromMinutes(10) });
             await upgradeService.UpgradeAsync(upgradeConfig, CancellationToken.None);
             Log.Information("[server] Upgrade to {Version} complete. Restarting...", version);
+            Environment.ExitCode = EdsExitCodes.IntentionalRestart;
             lifetime.StopApplication();
             return new EDS.Infrastructure.Notification.UpgradeResponse(Success: true, Error: null);
         }
@@ -381,6 +393,27 @@ static async Task RunServerAsync(
             CancellationToken.None).GetAwaiter().GetResult();
         Log.Information("[server] session ended: {SessionId}", sessionId);
     });
+
+    // ── Background: scheduled session renewal ────────────────────────────────
+    // Mirrors the Go implementation's --renew-interval flag (default 24h).
+    // Stops the host on the interval so the process manager can restart with a
+    // fresh HQ session and new NATS credentials regardless of expiry time.
+    Log.Debug("[server] Session renewal scheduled every {Hours}h.", renewInterval.TotalHours);
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            await Task.Delay(renewInterval, ct);
+            if (!ct.IsCancellationRequested)
+            {
+                Log.Information("[server] Renew interval elapsed ({Hours}h) — stopping for session renewal.",
+                    renewInterval.TotalHours);
+                Environment.ExitCode = EdsExitCodes.IntentionalRestart;
+                lifetime.StopApplication();
+            }
+        }
+        catch (OperationCanceledException) { /* normal shutdown */ }
+    }, ct);
 
     // ── Background: credential expiry watcher ────────────────────────────────
     // Re-establishes the session when the NATS credential is within 1 hour of
@@ -799,7 +832,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         // ── Transition to server ──────────────────────────────────────────────
         Log.Information("[import] Import complete. Starting server...");
-        await RunServerAsync(configPath, dataDir, verbose, tracker, ct);
+        await RunServerAsync(configPath, dataDir, verbose, TimeSpan.FromHours(24), tracker, ct);
     });
 
     return cmd;

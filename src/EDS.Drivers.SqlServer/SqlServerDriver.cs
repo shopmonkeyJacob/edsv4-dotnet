@@ -174,13 +174,16 @@ public sealed class SqlServerDriver : SqlDriverBase, IDriverHelp
 
         var uri = new Uri(url);
         var qs  = System.Web.HttpUtility.ParseQueryString(uri.Query);
+        // Default to trusting the server certificate for compatibility with self-signed certs.
+        // Override with trust-server-certificate=false in the URL to require a valid cert.
+        var trustCert = !string.Equals(qs["trust-server-certificate"], "false", StringComparison.OrdinalIgnoreCase);
         return new SqlConnectionStringBuilder
         {
             DataSource             = uri.Host + (uri.Port > 0 ? $",{uri.Port}" : string.Empty),
             InitialCatalog         = qs["database"] ?? string.Empty,
             UserID                 = qs["user id"]  ?? string.Empty,
             Password               = qs["password"] ?? string.Empty,
-            TrustServerCertificate = true
+            TrustServerCertificate = trustCert
         }.ConnectionString;
     }
 }

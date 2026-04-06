@@ -19,7 +19,8 @@ public sealed class TomlConfigurationProvider : FileConfigurationProvider
         var content = reader.ReadToEnd();
         var table = TomlSerializer.Deserialize<TomlTable>(content);
         Data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        FlattenToml(table, string.Empty, Data);
+        if (table is not null)
+            FlattenToml(table, string.Empty, Data);
     }
 
     private static void FlattenToml(TomlTable table, string prefix, IDictionary<string, string?> data)
