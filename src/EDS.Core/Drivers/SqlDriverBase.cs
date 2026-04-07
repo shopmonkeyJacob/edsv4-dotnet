@@ -25,6 +25,12 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     private int _count;
     private string _dbName = string.Empty;
 
+    /// <summary>How this driver instance writes events.</summary>
+    protected DriverMode Mode { get; private set; } = DriverMode.Upsert;
+
+    /// <summary>Database schema name for time-series events tables.</summary>
+    protected string EventsSchema { get; private set; } = "eds_events";
+
     public int MaxBatchSize => -1;
 
     // ── Abstract: dialect-specific ────────────────────────────────────────────
@@ -41,7 +47,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// <summary>Adds the @db parameter to a schema-query command.</summary>
     protected abstract void AddDbNameParameter(DbCommand cmd, string dbName);
 
-    /// <summary>Builds the full INSERT/UPSERT/MERGE or DELETE SQL for one event.</summary>
+    /// <summary>Builds the full INSERT/UPSERT/MERGE or DELETE SQL for one event (upsert mode).</summary>
     protected abstract string BuildSql(DbChangeEvent evt, Schema schema);
 
     /// <summary>CREATE TABLE (IF NOT EXISTS) DDL for a schema — used by EnsureTablesAsync.</summary>
@@ -83,12 +89,78 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     protected virtual string QuoteString(string value) =>
         "'" + value.Replace("'", "''") + "'";
 
+    // ── Virtual: time-series dialect overrides ────────────────────────────────
+
+    /// <summary>
+    /// SQL to ensure the events schema exists.
+    /// Return an empty string for dialects that have no schema concept (e.g. MySQL).
+    /// </summary>
+    protected virtual string GetEnsureEventsSchemaSql(string schemaName) =>
+        $"CREATE SCHEMA IF NOT EXISTS {QuoteId(schemaName)}";
+
+    /// <summary>Qualifies an events table name with the events schema.</summary>
+    protected virtual string QualifyEventsTable(string table, string eventsSchema) =>
+        $"{QuoteId(eventsSchema)}.{QuoteId(table + "_events")}";
+
+    /// <summary>Qualifies a view name with the events schema.</summary>
+    protected virtual string QualifyEventsView(string viewName, string eventsSchema) =>
+        $"{QuoteId(eventsSchema)}.{QuoteId(viewName)}";
+
+    /// <summary>
+    /// Extracts a JSON field value as text.
+    /// Default uses PostgreSQL/standard JSONB ->> operator. Override for other dialects.
+    /// </summary>
+    protected virtual string JsonExtract(string column, string field) =>
+        $"{column}->>{QuoteString(field)}";
+
+    /// <summary>SQL column definition for the auto-increment _seq primary key.</summary>
+    protected virtual string GetAutoIncrementPkDef() => "BIGSERIAL PRIMARY KEY";
+
+    /// <summary>SQL column type for JSON/JSONB blob storage.</summary>
+    protected virtual string GetJsonColumnType() => "JSONB";
+
+    /// <summary>
+    /// Builds a CREATE OR REPLACE VIEW statement.
+    /// Override for dialects that use different syntax (e.g. SQL Server's CREATE OR ALTER VIEW).
+    /// </summary>
+    protected virtual string BuildCreateOrReplaceViewSql(string qualifiedViewName, string selectSql) =>
+        $"CREATE OR REPLACE VIEW {qualifiedViewName} AS\n{selectSql}";
+
+    /// <summary>
+    /// DDL to ensure the events table exists with the fixed events schema.
+    /// Override for dialects that lack CREATE TABLE IF NOT EXISTS (e.g. SQL Server).
+    /// </summary>
+    protected virtual string BuildEnsureEventsTableSql(string table)
+    {
+        var qt = QualifyEventsTable(table, EventsSchema);
+        var jt = GetJsonColumnType();
+        var pk = GetAutoIncrementPkDef();
+        return $"""
+            CREATE TABLE IF NOT EXISTS {qt} (
+              _seq         {pk},
+              _event_id    TEXT,
+              _operation   TEXT NOT NULL,
+              _entity_id   TEXT,
+              _timestamp   BIGINT,
+              _mvcc_ts     TEXT,
+              _company_id  TEXT,
+              _location_id TEXT,
+              _model_ver   TEXT,
+              _diff        TEXT,
+              _before      {jt},
+              _after       {jt}
+            )
+            """;
+    }
+
     // ── IDriverLifecycle ──────────────────────────────────────────────────────
 
     public async Task StartAsync(DriverConfig config, CancellationToken ct = default)
     {
-        Logger = config.Logger;
-        Registry = config.SchemaRegistry;
+        Logger       = config.Logger;
+        Registry     = config.SchemaRegistry;
+        Mode         = config.Mode;
+        EventsSchema = config.EventsSchema;
         InitialiseDriver(config);
         await using var conn = await OpenConnectionAsync(ct);
         await RefreshSchemaAsync(conn, ct);
@@ -101,9 +173,17 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     public async Task<bool> ProcessAsync(ILogger logger, DbChangeEvent evt, CancellationToken ct = default)
     {
-        var schema = await Registry!.GetSchemaAsync(evt.Table, evt.ModelVersion, ct)
-            ?? throw new InvalidOperationException($"Schema not found for {evt.Table} v{evt.ModelVersion}");
-        var sql = BuildSql(evt, schema);
+        string sql;
+        if (Mode == DriverMode.TimeSeries)
+        {
+            sql = BuildInsertEventSql(evt);
+        }
+        else
+        {
+            var schema = await Registry!.GetSchemaAsync(evt.Table, evt.ModelVersion ?? string.Empty, ct)
+                ?? throw new InvalidOperationException($"Schema not found for {evt.Table} v{evt.ModelVersion}");
+            sql = BuildSql(evt, schema);
+        }
         logger.LogDebug("[{Driver}] Queuing {Op} on {Table}", GetType().Name, evt.Operation, evt.Table);
         _pending.Append(sql);
         _count++;
@@ -145,28 +225,49 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     public async Task MigrateNewTableAsync(ILogger logger, Schema schema, CancellationToken ct = default)
     {
+        if (Mode == DriverMode.TimeSeries)
+        {
+            // Events table schema is fixed — just ensure it exists and refresh views.
+            await using var conn = await OpenConnectionAsync(ct);
+            await ExecuteEventsTableAndViewsAsync(conn, schema, ct);
+            return;
+        }
+
         logger.LogWarning("[{Driver}] Dropping and recreating table {Table} — existing data will be lost.",
             GetType().Name, schema.Table);
-        await using var conn = await OpenConnectionAsync(ct);
-        await using var cmd = conn.CreateCommand();
+        await using var conn2 = await OpenConnectionAsync(ct);
+        await using var cmd = conn2.CreateCommand();
         cmd.CommandText = BuildDropAndCreateTableSql(schema);
         await cmd.ExecuteNonQueryAsync(ct);
-        await RefreshSchemaAsync(conn, ct);
+        await RefreshSchemaAsync(conn2, ct);
     }
 
     public async Task MigrateNewColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> newColumns, CancellationToken ct = default)
     {
-        await using var conn = await OpenConnectionAsync(ct);
+        if (Mode == DriverMode.TimeSeries)
+        {
+            // Events table schema is fixed — just recreate views to include any new columns.
+            await using var conn = await OpenConnectionAsync(ct);
+            await using var curViewCmd = conn.CreateCommand();
+            curViewCmd.CommandText = BuildCurrentViewSql(schema.Table);
+            await curViewCmd.ExecuteNonQueryAsync(ct);
+            await using var histViewCmd = conn.CreateCommand();
+            histViewCmd.CommandText = BuildHistoryViewSql(schema.Table, schema);
+            await histViewCmd.ExecuteNonQueryAsync(ct);
+            return;
+        }
+
+        await using var conn2 = await OpenConnectionAsync(ct);
         foreach (var col in newColumns)
         {
             if (DbSchema.TryGetValue(schema.Table, out var cols) && cols.ContainsKey(col)) continue;
             var prop = schema.Properties[col];
             var sql = BuildAlterAddColumnSql(schema.Table, col, PropToSqlType(prop, isPrimaryKey: false));
-            await using var cmd = conn.CreateCommand();
+            await using var cmd = conn2.CreateCommand();
             cmd.CommandText = sql;
             await cmd.ExecuteNonQueryAsync(ct);
         }
-        await RefreshSchemaAsync(conn, ct);
+        await RefreshSchemaAsync(conn2, ct);
     }
 
     // ── Shared internals ──────────────────────────────────────────────────────
@@ -201,7 +302,13 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         var schemas = await Registry.GetLatestSchemaAsync(ct);
         if (schemas.Count == 0) return;
 
-        // Batch all CREATE IF NOT EXISTS into a single round trip
+        if (Mode == DriverMode.TimeSeries)
+        {
+            await EnsureEventsTablesAsync(conn, schemas, ct);
+            return;
+        }
+
+        // Upsert mode: batch all CREATE IF NOT EXISTS into a single round trip
         var sb = new StringBuilder();
         int toCreate = 0;
         foreach (var (_, schema) in schemas)
@@ -227,6 +334,101 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         }
     }
 
+    private async Task EnsureEventsTablesAsync(DbConnection conn, SchemaMap schemas, CancellationToken ct)
+    {
+        // 1. Ensure the events schema exists (no-op for dialects without schemas, e.g. MySQL)
+        var schemaSql = GetEnsureEventsSchemaSql(EventsSchema);
+        if (!string.IsNullOrEmpty(schemaSql))
+        {
+            await using var schemaCmd = conn.CreateCommand();
+            schemaCmd.CommandText = schemaSql;
+            await schemaCmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // 2. Ensure each events table and its views exist
+        foreach (var (_, schema) in schemas)
+            await ExecuteEventsTableAndViewsAsync(conn, schema, ct);
+
+        Logger!.LogInformation("[{Driver}] Ensured {Count} events table(s) and views in schema '{Schema}'.",
+            GetType().Name, schemas.Count, EventsSchema);
+    }
+
+    /// <summary>
+    /// Ensures the events table exists for the given source table and recreates both views.
+    /// Each DDL is executed as a separate command so that dialects with per-statement
+    /// batch restrictions (e.g. SQL Server's CREATE VIEW must be first in batch) are handled.
+    /// </summary>
+    private async Task ExecuteEventsTableAndViewsAsync(DbConnection conn, Schema schema, CancellationToken ct)
+    {
+        await using var tableCmd = conn.CreateCommand();
+        tableCmd.CommandText = BuildEnsureEventsTableSql(schema.Table);
+        await tableCmd.ExecuteNonQueryAsync(ct);
+
+        await using var curViewCmd = conn.CreateCommand();
+        curViewCmd.CommandText = BuildCurrentViewSql(schema.Table);
+        await curViewCmd.ExecuteNonQueryAsync(ct);
+
+        await using var histViewCmd = conn.CreateCommand();
+        histViewCmd.CommandText = BuildHistoryViewSql(schema.Table, schema);
+        await histViewCmd.ExecuteNonQueryAsync(ct);
+    }
+
+    // ── Time-series SQL builders ──────────────────────────────────────────────
+
+    private string BuildInsertEventSql(DbChangeEvent evt)
+    {
+        var qualifiedTable = QualifyEventsTable(evt.Table, EventsSchema);
+        var entityId = evt.GetPrimaryKey();
+        var diff     = evt.Diff is { Length: > 0 }
+            ? QuoteString(JsonSerializer.Serialize(evt.Diff))
+            : "NULL";
+        var before   = evt.Before.HasValue ? QuoteString(evt.Before.Value.GetRawText()) : "NULL";
+        var after    = evt.After.HasValue  ? QuoteString(evt.After.Value.GetRawText())  : "NULL";
+        var mvccTs   = string.IsNullOrEmpty(evt.MvccTimestamp) ? "NULL" : QuoteString(evt.MvccTimestamp);
+
+        return $"INSERT INTO {qualifiedTable} " +
+               $"(_event_id, _operation, _entity_id, _timestamp, _mvcc_ts, _company_id, _location_id, _model_ver, _diff, _before, _after) " +
+               $"VALUES ({QuoteString(evt.Id)}, {QuoteString(evt.Operation)}, {QuoteString(entityId)}, " +
+               $"{evt.Timestamp}, {mvccTs}, " +
+               $"{(evt.CompanyId  is null ? "NULL" : QuoteString(evt.CompanyId))}, " +
+               $"{(evt.LocationId is null ? "NULL" : QuoteString(evt.LocationId))}, " +
+               $"{QuoteString(evt.ModelVersion ?? string.Empty)}, {diff}, {before}, {after});\n";
+    }
+
+    private string BuildCurrentViewSql(string table)
+    {
+        var qualifiedTable = QualifyEventsTable(table, EventsSchema);
+        var qualifiedView  = QualifyEventsView("current_" + table, EventsSchema);
+        var selectSql      = $"""
+            SELECT * FROM (
+              SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn
+              FROM {qualifiedTable}
+            ) ranked
+            WHERE rn = 1 AND _operation <> 'DELETE'
+            """;
+        return BuildCreateOrReplaceViewSql(qualifiedView, selectSql);
+    }
+
+    private string BuildHistoryViewSql(string table, Schema schema)
+    {
+        var qualifiedTable = QualifyEventsTable(table, EventsSchema);
+        var qualifiedView  = QualifyEventsView(table + "_history", EventsSchema);
+
+        var fieldProjections = schema.Columns()
+            .Select(col =>
+                $"  COALESCE({JsonExtract("_after", col)}, {JsonExtract("_before", col)}) AS {QuoteId(col)}")
+            .ToList();
+
+        var selectSql =
+            "SELECT\n  _seq, _event_id, _operation, _entity_id, _timestamp, _mvcc_ts,\n" +
+            "  _company_id, _location_id, _model_ver,\n" +
+            string.Join(",\n", fieldProjections) + "\n" +
+            $"FROM {qualifiedTable}";
+
+        return BuildCreateOrReplaceViewSql(qualifiedView, selectSql);
+    }
+
     // ── IDriverImport / IImportHandler ────────────────────────────────────────
 
     private const int ImportBatchSize = 500;
@@ -236,10 +438,17 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// current database schema, but skips the startup table-creation sweep.
     /// </summary>
     public async Task InitForImportAsync(
-        ILogger logger, ISchemaRegistry registry, string url, CancellationToken ct = default)
+        ILogger logger,
+        ISchemaRegistry registry,
+        string url,
+        DriverMode mode = DriverMode.Upsert,
+        string eventsSchema = "eds_events",
+        CancellationToken ct = default)
     {
-        Logger   = logger;
-        Registry = registry;
+        Logger       = logger;
+        Registry     = registry;
+        Mode         = mode;
+        EventsSchema = eventsSchema;
         InitialiseDriver(new DriverConfig
         {
             Url            = url,
@@ -247,6 +456,8 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
             SchemaRegistry = registry,
             Tracker        = null!,   // not used during import
             DataDir        = string.Empty,
+            Mode           = mode,
+            EventsSchema   = eventsSchema,
         });
         await using var conn = await OpenConnectionAsync(ct);
         await RefreshSchemaAsync(conn, ct);
@@ -258,11 +469,15 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     /// <summary>
     /// Appends one event to the pending batch and flushes when <see cref="ImportBatchSize"/> is reached.
-    /// Builds SQL directly from the supplied schema to avoid a registry round-trip per row.
+    /// In upsert mode, builds SQL directly from the supplied schema to avoid a registry round-trip per row.
+    /// In time-series mode, inserts the raw event into the events table.
     /// </summary>
     public async Task ImportEventAsync(DbChangeEvent evt, Schema schema, CancellationToken ct = default)
     {
-        _pending.Append(BuildSql(evt, schema));
+        var sql = Mode == DriverMode.TimeSeries
+            ? BuildInsertEventSql(evt)
+            : BuildSql(evt, schema);
+        _pending.Append(sql);
         _count++;
         if (_count >= ImportBatchSize)
             await FlushAsync(Logger!, ct);

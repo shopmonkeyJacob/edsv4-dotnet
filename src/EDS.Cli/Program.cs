@@ -1,4 +1,5 @@
 using EDS.Core;
+using EDS.Core.Abstractions;
 using EDS.Core.Registry;
 using EDS.Drivers.AzureBlob;
 using EDS.Drivers.EventHub;
@@ -67,18 +68,32 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
         Description = "Interval at which the server stops itself so the process manager can restart it with a fresh session (default: 24h).",
         Hidden      = true,
     };
+    var driverModeOption = new Option<string>("--driver-mode")
+    {
+        Description = "How the SQL driver writes events: 'upsert' (default) mirrors source tables; " +
+                      "'timeseries' appends every event to an audit log with auto-maintained views.",
+    };
+    var eventsSchemaOption = new Option<string>("--events-schema")
+    {
+        Description = "Database schema that holds the events tables in timeseries mode (default: eds_events).",
+        Hidden      = true,
+    };
 
     var cmd = new Command("server") { Description = "Start the EDS streaming server." };
     cmd.Options.Add(cfgOpt);
     cmd.Options.Add(verbOpt);
     cmd.Options.Add(ddOpt);
     cmd.Options.Add(renewIntervalOption);
+    cmd.Options.Add(driverModeOption);
+    cmd.Options.Add(eventsSchemaOption);
     cmd.SetAction(async (parseResult, ct) =>
     {
         var cfg            = parseResult.GetValue(cfgOpt);
         var verbose        = parseResult.GetValue(verbOpt);
         var dataDir        = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
         var renewInterval  = parseResult.GetValue(renewIntervalOption) ?? TimeSpan.FromHours(24);
+        var driverMode     = ParseDriverMode(parseResult.GetValue(driverModeOption));
+        var eventsSchema   = parseResult.GetValue(eventsSchemaOption) ?? "eds_events";
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
@@ -127,6 +142,8 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
                         DriverUrl        = driverUrl,
                         ApiKey           = apiKey,
                         IsPostEnrollment = true,
+                        Mode             = driverMode,
+                        EventsSchema     = eventsSchema,
                     };
                     await RunImportPipelineAsync(importOpts, tracker, ct);
                 }
@@ -137,7 +154,7 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
             }
         }
 
-        await RunServerAsync(configPath, dataDir, verbose, renewInterval, tracker, ct);
+        await RunServerAsync(configPath, dataDir, verbose, renewInterval, tracker, driverMode, eventsSchema, ct);
     });
     return cmd;
 }
@@ -152,7 +169,9 @@ static async Task RunServerAsync(
     bool verbose,
     TimeSpan renewInterval,
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
-    CancellationToken ct)
+    DriverMode driverMode = DriverMode.Upsert,
+    string eventsSchema = "eds_events",
+    CancellationToken ct = default)
 {
     // ── Load config ───────────────────────────────────────────────────────────
     var config = new ConfigurationBuilder()
@@ -228,7 +247,7 @@ static async Task RunServerAsync(
     // Build the handlers object before the host so we can set the five handlers
     // that require IHostApplicationLifetime or NatsConsumerService (available only
     // after host.Build()) by mutating the same reference the NotificationService holds.
-    var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts);
+    var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts, driverMode, eventsSchema);
 
     var host = Host.CreateDefaultBuilder()
         .UseSerilog((_, __, lc) => lc
@@ -294,6 +313,8 @@ static async Task RunServerAsync(
                             SchemaRegistry = schemaReg,
                             Tracker        = t,
                             DataDir        = dataDir,
+                            Mode           = driverMode,
+                            EventsSchema   = eventsSchema,
                         }
                     };
                 });
@@ -533,7 +554,7 @@ static async Task<bool> RunImportPipelineAsync(
 
     // ── Initialise driver for import ──────────────────────────────────────────
     if (importDriver is not null)
-        await importDriver.InitForImportAsync(importLogger, schemaRegistry, opts.DriverUrl, ct);
+        await importDriver.InitForImportAsync(importLogger, schemaRegistry, opts.DriverUrl, opts.Mode, opts.EventsSchema, ct);
     else if (directImporter is not null)
         await directImporter.InitForDirectImportAsync(importLogger, opts.DriverUrl, ct);
 
@@ -751,6 +772,8 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     var schemaOnlyOpt  = new Option<bool>("--schema-only")    { Description = "Create tables only; do not import any rows" };
     var singleOpt      = new Option<bool>("--single")         { Description = "Process one table at a time (no parallelism)" };
     var resumeOpt      = new Option<bool>("--resume")         { Description = "Resume the last interrupted import from the first unfinished file (implies --no-delete --no-cleanup)" };
+    var importModeOpt  = new Option<string>("--driver-mode")  { Description = "How the SQL driver writes events: 'upsert' (default) or 'timeseries' (append-only event log with auto-maintained views)." };
+    var importSchemaOpt = new Option<string>("--events-schema") { Description = "Database schema for events tables in timeseries mode (default: eds_events).", Hidden = true };
 
     var cmd = new Command("import") { Description = "Import a snapshot of Shopmonkey data." };
     cmd.Options.Add(cfgOpt);
@@ -772,6 +795,8 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     cmd.Options.Add(schemaOnlyOpt);
     cmd.Options.Add(singleOpt);
     cmd.Options.Add(resumeOpt);
+    cmd.Options.Add(importModeOpt);
+    cmd.Options.Add(importSchemaOpt);
 
     cmd.SetAction(async (parseResult, ct) =>
     {
@@ -780,6 +805,8 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
         var dataDir    = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
         var urlArg     = parseResult.GetValue(urlOpt);
         var keyArg     = parseResult.GetValue(keyOpt);
+        var driverMode = ParseDriverMode(parseResult.GetValue(importModeOpt));
+        var eventsSchema = parseResult.GetValue(importSchemaOpt) ?? "eds_events";
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
@@ -828,6 +855,8 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
             SchemaOnly  = parseResult.GetValue(schemaOnlyOpt),
             Single      = parseResult.GetValue(singleOpt),
             Resume      = resume,
+            Mode        = driverMode,
+            EventsSchema = eventsSchema,
         };
 
         if (!await RunImportPipelineAsync(opts, tracker, ct)) return;
@@ -838,11 +867,19 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         // ── Transition to server ──────────────────────────────────────────────
         Log.Information("[import] Import complete. Starting server...");
-        await RunServerAsync(configPath, dataDir, verbose, TimeSpan.FromHours(24), tracker, ct);
+        await RunServerAsync(configPath, dataDir, verbose, TimeSpan.FromHours(24), tracker, driverMode, eventsSchema, ct);
     });
 
     return cmd;
 }
+
+/// <summary>Parses a --driver-mode string value (case-insensitive) to a DriverMode enum.</summary>
+static DriverMode ParseDriverMode(string? value) =>
+    value?.ToLowerInvariant() switch
+    {
+        "timeseries" or "time-series" or "time_series" => DriverMode.TimeSeries,
+        _ => DriverMode.Upsert,
+    };
 
 static Command BuildVersionCommand()
 {
@@ -868,7 +905,7 @@ static Command BuildEnrollCommand(Option<FileInfo?> cfgOpt)
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
 
-        await ConfigFileHelper.SetValueAsync(configPath, "token", key);
+        await ConfigFileHelper.SetValueAsync(configPath, "token", key!);
         if (!string.IsNullOrEmpty(sid))
             await ConfigFileHelper.SetValueAsync(configPath, "server_id", sid);
 
@@ -922,7 +959,9 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
     string apiKey,
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
     DriverRegistry registry,
-    CancellationTokenSource backgroundImportCts)
+    CancellationTokenSource backgroundImportCts,
+    DriverMode driverMode = DriverMode.Upsert,
+    string eventsSchema = "eds_events")
 {
     // Prevents concurrent imports (Configure+backfill and Import notifications could
     // arrive close together). If an import is already running, subsequent requests skip.
@@ -1015,13 +1054,15 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
                         var savedLogger = Log.Logger;
                         var importOpts = new ImportRunOptions
                         {
-                            DataDir    = dataDir,
-                            ConfigPath = configPath,
-                            Verbose    = verbose,
-                            DriverUrl  = url,
-                            ApiKey     = apiKey,
-                            NoConfirm  = true,
-                            LogFile    = importLogPath,
+                            DataDir      = dataDir,
+                            ConfigPath   = configPath,
+                            Verbose      = verbose,
+                            DriverUrl    = url,
+                            ApiKey       = apiKey,
+                            NoConfirm    = true,
+                            LogFile      = importLogPath,
+                            Mode         = driverMode,
+                            EventsSchema = eventsSchema,
                         };
                         _ = Task.Run(async () =>
                         {
@@ -1114,12 +1155,14 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
             {
                 var importOpts = new ImportRunOptions
                 {
-                    DataDir    = dataDir,
-                    ConfigPath = configPath,
-                    Verbose    = verbose,
-                    DriverUrl  = currentDriverUrl,
-                    ApiKey     = currentApiKey,
-                    NoConfirm  = true,
+                    DataDir      = dataDir,
+                    ConfigPath   = configPath,
+                    Verbose      = verbose,
+                    DriverUrl    = currentDriverUrl,
+                    ApiKey       = currentApiKey,
+                    NoConfirm    = true,
+                    Mode         = driverMode,
+                    EventsSchema = eventsSchema,
                 };
                 await RunImportPipelineAsync(importOpts, tracker, backgroundImportCts.Token);
             }

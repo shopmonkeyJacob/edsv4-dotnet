@@ -1,3 +1,5 @@
+using EDS.Core.Abstractions;
+
 namespace EDS.Cli;
 
 /// <summary>
@@ -12,6 +14,12 @@ internal sealed record ImportRunOptions
     public required bool   Verbose    { get; init; }
     public required string DriverUrl  { get; init; }
     public required string ApiKey     { get; init; }
+
+    /// <summary>How the SQL driver writes events. Default: Upsert.</summary>
+    public DriverMode Mode         { get; init; } = DriverMode.Upsert;
+
+    /// <summary>Events schema name used in TimeSeries mode. Default: eds_events.</summary>
+    public string EventsSchema     { get; init; } = "eds_events";
 
     public string?   JobId       { get; init; }
     public string?   Dir         { get; init; }

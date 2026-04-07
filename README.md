@@ -65,11 +65,12 @@ Alternatively, open **System Settings → Privacy & Security → Security** and 
 
 ### `eds server` options
 
-| Flag            | Description                                          |
-|-----------------|------------------------------------------------------|
-| `--config`      | Path to config file (default: `data/config.toml`)   |
-| `--data-dir`    | Directory for state, logs, and credentials           |
-| `--verbose`     | Enable debug-level console output                    |
+| Flag              | Description                                                                   |
+|-------------------|-------------------------------------------------------------------------------|
+| `--config`        | Path to config file (default: `data/config.toml`)                            |
+| `--data-dir`      | Directory for state, logs, and credentials                                    |
+| `--verbose`       | Enable debug-level console output                                             |
+| `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode)|
 
 ### `eds import` options
 
@@ -89,6 +90,7 @@ Alternatively, open **System Settings → Privacy & Security → Security** and 
 | `--schema-only`   | Create tables without importing any rows                          |
 | `--no-cleanup`    | Keep the temporary download directory after import                |
 | `--resume`        | Resume the last interrupted import from the first unfinished file (implies `--no-delete --no-cleanup`) |
+| `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode) |
 
 #### Import resumability
 
@@ -99,6 +101,99 @@ eds import --resume
 ```
 
 Because rows are written via MERGE/upsert, any file that was only partially processed when the interruption occurred is safely re-applied from the start. The checkpoint is automatically cleared after a successful full import.
+
+## Time-Series Mode
+
+By default, SQL drivers mirror the source tables using **upsert** semantics — each row reflects the latest known state of the corresponding record in Shopmonkey.
+
+Passing `--driver-mode timeseries` switches all SQL drivers to an **append-only event log** model. Every CDC event is inserted as a new row; no rows are ever updated or deleted. This enables full audit history and point-in-time queries at the cost of needing to join against the latest event per entity when you want current state.
+
+### Events table schema
+
+For each Shopmonkey table `{table}`, a fixed-schema table is created:
+
+| Dialect         | Table location                     |
+|-----------------|------------------------------------|
+| PostgreSQL      | `eds_events.{table}_events`        |
+| MySQL / MariaDB | `{table}__events` (same database)  |
+| SQL Server      | `eds_events.{table}_events`        |
+| Snowflake       | `eds_events.{table}_events`        |
+
+All events tables share the same columns regardless of the source table structure:
+
+| Column        | Type   | Description                                              |
+|---------------|--------|----------------------------------------------------------|
+| `_seq`        | BIGINT | Auto-increment primary key (insertion order)             |
+| `_event_id`   | TEXT   | Unique event ID from Shopmonkey                          |
+| `_operation`  | TEXT   | `CREATE`, `UPDATE`, or `DELETE`                          |
+| `_entity_id`  | TEXT   | Primary key of the affected record                       |
+| `_timestamp`  | BIGINT | Event timestamp in milliseconds since epoch              |
+| `_mvcc_ts`    | TEXT   | MVCC timestamp from the source database                  |
+| `_company_id` | TEXT   | Shopmonkey company ID                                    |
+| `_location_id`| TEXT   | Shopmonkey location ID                                   |
+| `_model_ver`  | TEXT   | Shopmonkey schema model version                          |
+| `_diff`       | TEXT   | JSON array of changed field names (UPDATE only)          |
+| `_before`     | JSON   | Full record state before the change (JSONB on PostgreSQL)|
+| `_after`      | JSON   | Full record state after the change (JSONB on PostgreSQL) |
+
+### Auto-maintained views
+
+Two views are automatically created and refreshed whenever the schema changes:
+
+**`current_{table}`** — latest state of each entity (equivalent to the upsert mirror):
+
+```sql
+-- Example: latest state of all work orders
+SELECT * FROM eds_events.current_work_orders;
+```
+
+**`{table}_history`** — full audit trail with each schema column extracted from the JSON payloads:
+
+```sql
+-- Example: full change history for a specific work order
+SELECT _seq, _operation, _timestamp, id, status, total
+FROM eds_events.work_orders_history
+WHERE id = 'wo-abc123'
+ORDER BY _timestamp;
+```
+
+### Point-in-time queries
+
+To reconstruct the state of all records at a specific moment, query the `current_{table}` view filtered by timestamp — or use a window function directly:
+
+```sql
+-- State of all work orders as of a specific Unix millisecond timestamp
+SELECT * FROM (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn
+  FROM eds_events.work_orders_events
+  WHERE _timestamp <= 1743897600000   -- 2025-02-06T00:00:00Z
+) t
+WHERE rn = 1 AND _operation <> 'DELETE';
+```
+
+### Joining across tables in time-series mode
+
+When joining time-series tables, use the auto-maintained views to get current state on both sides:
+
+```sql
+-- Current work orders joined to current customer
+SELECT wo.id, wo.status, c.name AS customer_name
+FROM eds_events.current_work_orders wo
+JOIN eds_events.current_customers c ON c.id = wo.customer_id;
+```
+
+### Usage
+
+```sh
+# Start the server in time-series mode
+eds server --driver-mode timeseries
+
+# Run a bulk import into time-series tables then start the server
+eds import --driver-mode timeseries --url postgres://user:password@localhost/mydb
+```
+
+> **Note:** Upsert and time-series data can coexist in the same database. The events tables live in the `eds_events` schema (or use a `__events` suffix in MySQL), keeping them separate from any upsert mirror tables.
 
 ## Driver Connection Strings
 
@@ -161,9 +256,9 @@ dotnet build
 
 # Publish self-contained binaries (always pass -p:Version so the version
 # string is stamped into the binary and reported to Shopmonkey HQ)
-dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64  -p:Version=0.9.1-rc
-dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64  -p:Version=0.9.1-rc
-dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64    -p:Version=0.9.1-rc
+dotnet publish src/EDS.Cli -r linux-x64  -o publish/linux-x64  -p:Version=0.9.2-rc
+dotnet publish src/EDS.Cli -r osx-arm64  -o publish/osx-arm64  -p:Version=0.9.2-rc
+dotnet publish src/EDS.Cli -r win-x64    -o publish/win-x64    -p:Version=0.9.2-rc
 ```
 
 Without `-p:Version`, the binary reports version `dev` to HQ. The CI/CD pipeline sets this

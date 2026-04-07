@@ -576,20 +576,21 @@ public sealed class NatsConsumerService : BackgroundService
         if (found && currentVersion == evt.ModelVersion)
             return false; // Nothing changed
 
-        var newSchema = await registry.GetSchemaAsync(evt.Table, evt.ModelVersion, ct);
+        var modelVersion = evt.ModelVersion ?? string.Empty;
+        var newSchema = await registry.GetSchemaAsync(evt.Table, modelVersion, ct);
         if (newSchema is null)
         {
             _logger.LogWarning("[consumer] Schema not found for {Table} v{Version}. Skipping migration.",
-                evt.Table, evt.ModelVersion);
+                evt.Table, modelVersion);
             return false;
         }
 
         if (!found)
         {
             // Brand-new table
-            _logger.LogInformation("[consumer] Migrating new table: {Table} v{Version}", evt.Table, evt.ModelVersion);
+            _logger.LogInformation("[consumer] Migrating new table: {Table} v{Version}", evt.Table, modelVersion);
             await migration.MigrateNewTableAsync(_logger, newSchema, ct);
-            await registry.SetTableVersionAsync(evt.Table, evt.ModelVersion, ct);
+            await registry.SetTableVersionAsync(evt.Table, modelVersion, ct);
             return true;
         }
 
@@ -604,12 +605,12 @@ public sealed class NatsConsumerService : BackgroundService
             if (newCols.Count > 0)
             {
                 _logger.LogInformation("[consumer] Migrating {Count} new column(s) for {Table} v{Version}: {Columns}",
-                    newCols.Count, evt.Table, evt.ModelVersion, string.Join(", ", newCols));
+                    newCols.Count, evt.Table, modelVersion, string.Join(", ", newCols));
                 await migration.MigrateNewColumnsAsync(_logger, newSchema, newCols, ct);
             }
         }
 
-        await registry.SetTableVersionAsync(evt.Table, evt.ModelVersion, ct);
+        await registry.SetTableVersionAsync(evt.Table, modelVersion, ct);
         return true;
     }
 

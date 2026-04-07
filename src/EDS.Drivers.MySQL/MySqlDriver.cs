@@ -20,6 +20,24 @@ public sealed class MySqlDriver : SqlDriverBase, IDriverHelp
     public string ExampleUrl  => "mysql://user:password@localhost:3306/mydb";
     public string Help        => "The database schema mirrors the Shopmonkey transactional database schema.";
 
+    // ── SqlDriverBase: time-series overrides ──────────────────────────────────
+
+    // MySQL has no schema concept within a database; use a table-name prefix instead.
+    protected override string GetEnsureEventsSchemaSql(string schemaName) => string.Empty;
+
+    protected override string QualifyEventsTable(string table, string eventsSchema) =>
+        QuoteId(table + "__events");
+
+    protected override string QualifyEventsView(string viewName, string eventsSchema) =>
+        QuoteId(viewName);
+
+    protected override string JsonExtract(string column, string field) =>
+        $"JSON_UNQUOTE(JSON_EXTRACT({column}, '$.{field.Replace("'", "\\'")}'))";
+
+    protected override string GetAutoIncrementPkDef() => "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY";
+
+    protected override string GetJsonColumnType() => "JSON";
+
     // ── SqlDriverBase: driver initialisation ──────────────────────────────────
 
     protected override void InitialiseDriver(DriverConfig config) =>

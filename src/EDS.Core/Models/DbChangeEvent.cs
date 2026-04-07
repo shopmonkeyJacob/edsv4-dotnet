@@ -28,7 +28,7 @@ public sealed class DbChangeEvent
 
     [Key("modelVersion")]
     [JsonPropertyName("modelVersion")]
-    public string ModelVersion { get; init; } = string.Empty;
+    public string? ModelVersion { get; init; }
 
     [Key("companyId")]
     [JsonPropertyName("companyId")]
@@ -60,7 +60,7 @@ public sealed class DbChangeEvent
 
     [Key("mvccTimestamp")]
     [JsonPropertyName("mvccTimestamp")]
-    public string MvccTimestamp { get; init; } = string.Empty;
+    public string? MvccTimestamp { get; init; }
 
     /// <summary>Not on the wire — set to true during bulk import.</summary>
     [IgnoreMember]

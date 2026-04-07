@@ -48,7 +48,7 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
 
     public async Task<bool> ProcessAsync(ILogger logger, DbChangeEvent evt, CancellationToken ct = default)
     {
-        var schema = await _registry!.GetSchemaAsync(evt.Table, evt.ModelVersion, ct)
+        var schema = await _registry!.GetSchemaAsync(evt.Table, evt.ModelVersion ?? string.Empty, ct)
             ?? throw new InvalidOperationException($"Schema not found for {evt.Table} v{evt.ModelVersion}");
         _pending.Add((evt, schema));
         return _pending.Count >= MaxBatchSize;

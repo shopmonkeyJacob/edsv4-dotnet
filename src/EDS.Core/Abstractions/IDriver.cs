@@ -132,7 +132,13 @@ public interface IDriverImport : IImportHandler
     /// Initialises the driver for import use (opens connection, reflects schema)
     /// without running the full startup table-creation scan.
     /// </summary>
-    Task InitForImportAsync(ILogger logger, ISchemaRegistry registry, string url, CancellationToken ct = default);
+    Task InitForImportAsync(
+        ILogger logger,
+        ISchemaRegistry registry,
+        string url,
+        DriverMode mode = DriverMode.Upsert,
+        string eventsSchema = "eds_events",
+        CancellationToken ct = default);
 }
 
 /// <summary>

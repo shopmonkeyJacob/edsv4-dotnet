@@ -25,6 +25,60 @@ public sealed class SqlServerDriver : SqlDriverBase, IDriverHelp
     protected override string QuoteString(string value) =>
         "N'" + value.Replace("'", "''") + "'";
 
+    // ── SqlDriverBase: time-series overrides ──────────────────────────────────
+
+    protected override string GetEnsureEventsSchemaSql(string schemaName)
+    {
+        // CREATE SCHEMA must be the only statement in a batch; use EXEC() to wrap it.
+        var escaped = schemaName.Replace("'", "''");
+        return $"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'{escaped}') " +
+               $"EXEC(N'CREATE SCHEMA [{schemaName.Replace("]", "]]")}]')";
+    }
+
+    protected override string QualifyEventsTable(string table, string eventsSchema) =>
+        $"[{eventsSchema.Replace("]", "]]")}].[{(table + "_events").Replace("]", "]]")}]";
+
+    protected override string QualifyEventsView(string viewName, string eventsSchema) =>
+        $"[{eventsSchema.Replace("]", "]]")}].[{viewName.Replace("]", "]]")}]";
+
+    protected override string JsonExtract(string column, string field) =>
+        $"JSON_VALUE({column}, N'$.{field}')";
+
+    protected override string GetAutoIncrementPkDef() => "BIGINT IDENTITY(1,1) PRIMARY KEY";
+
+    protected override string GetJsonColumnType() => "NVARCHAR(MAX)";
+
+    // SQL Server: CREATE VIEW must be the first statement in a batch — use CREATE OR ALTER VIEW.
+    protected override string BuildCreateOrReplaceViewSql(string qualifiedViewName, string selectSql) =>
+        $"CREATE OR ALTER VIEW {qualifiedViewName} AS\n{selectSql}";
+
+    // SQL Server does not support CREATE TABLE IF NOT EXISTS — use OBJECT_ID check.
+    protected override string BuildEnsureEventsTableSql(string table)
+    {
+        var qt          = QualifyEventsTable(table, EventsSchema);
+        var fullName    = $"{EventsSchema}.{table}_events";
+        var escapedName = fullName.Replace("'", "''");
+        return $"""
+            IF OBJECT_ID(N'{escapedName}', N'U') IS NULL
+            BEGIN
+            CREATE TABLE {qt} (
+              _seq         BIGINT IDENTITY(1,1) PRIMARY KEY,
+              _event_id    NVARCHAR(MAX),
+              _operation   NVARCHAR(MAX) NOT NULL,
+              _entity_id   NVARCHAR(MAX),
+              _timestamp   BIGINT,
+              _mvcc_ts     NVARCHAR(MAX),
+              _company_id  NVARCHAR(MAX),
+              _location_id NVARCHAR(MAX),
+              _model_ver   NVARCHAR(MAX),
+              _diff        NVARCHAR(MAX),
+              _before      NVARCHAR(MAX),
+              _after       NVARCHAR(MAX)
+            )
+            END
+            """;
+    }
+
     // ── SqlDriverBase: driver initialisation ──────────────────────────────────
 
     protected override void InitialiseDriver(DriverConfig config) =>

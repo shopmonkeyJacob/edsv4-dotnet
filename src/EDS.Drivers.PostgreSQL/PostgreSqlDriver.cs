@@ -29,6 +29,19 @@ public sealed class PostgreSqlDriver : SqlDriverBase, IDriverHelp, IDriverAlias
     protected override string SqlTrue  => "TRUE";
     protected override string SqlFalse => "FALSE";
 
+    // ── SqlDriverBase: time-series overrides ──────────────────────────────────
+
+    // PostgreSQL uses the JSONB ->> operator for JSON text extraction.
+    protected override string JsonExtract(string column, string field) =>
+        $"{column}->>{QuoteString(field)}";
+
+    // PostgreSQL's CREATE OR REPLACE VIEW has a limitation: it cannot add new
+    // columns to an existing view. Use DROP ... CASCADE + CREATE to avoid errors
+    // when the Shopmonkey schema evolves and new columns appear in the history view.
+    protected override string BuildCreateOrReplaceViewSql(string qualifiedViewName, string selectSql) =>
+        $"DROP VIEW IF EXISTS {qualifiedViewName} CASCADE;\n" +
+        $"CREATE VIEW {qualifiedViewName} AS\n{selectSql}";
+
     // ── SqlDriverBase: driver initialisation ──────────────────────────────────
 
     protected override void InitialiseDriver(DriverConfig config) =>
