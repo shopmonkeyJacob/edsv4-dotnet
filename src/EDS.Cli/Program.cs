@@ -88,15 +88,20 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     cmd.Options.Add(eventsSchemaOption);
     cmd.SetAction(async (parseResult, ct) =>
     {
-        var cfg            = parseResult.GetValue(cfgOpt);
-        var verbose        = parseResult.GetValue(verbOpt);
-        var dataDir        = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
-        var renewInterval  = parseResult.GetValue(renewIntervalOption) ?? TimeSpan.FromHours(24);
-        var driverMode     = ParseDriverMode(parseResult.GetValue(driverModeOption));
-        var eventsSchema   = parseResult.GetValue(eventsSchemaOption) ?? "eds_events";
+        var cfg           = parseResult.GetValue(cfgOpt);
+        var verbose       = parseResult.GetValue(verbOpt);
+        var dataDir       = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
+        var renewInterval = parseResult.GetValue(renewIntervalOption) ?? TimeSpan.FromHours(24);
+        var flagMode      = parseResult.GetValue(driverModeOption);
+        var flagSchema    = parseResult.GetValue(eventsSchemaOption);
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
+
+        // Resolve driver mode: flag vs config.toml, with conflict prompt if they differ
+        var storedConfig = new ConfigurationBuilder().AddTomlFile(configPath, optional: true).Build();
+        var driverMode   = await ResolveDriverModeAsync(flagMode,   storedConfig["driver_mode"],   configPath, ct: ct);
+        var eventsSchema = await ResolveEventsSchemaAsync(flagSchema, storedConfig["events_schema"], configPath, ct);
 
         var (enrolled, justEnrolled) = await EnrollmentFlow.EnrollIfNeededAsync(dataDir, configPath, ct);
         if (!enrolled) return;
@@ -805,8 +810,9 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
         var dataDir    = parseResult.GetValue(ddOpt) ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
         var urlArg     = parseResult.GetValue(urlOpt);
         var keyArg     = parseResult.GetValue(keyOpt);
-        var driverMode = ParseDriverMode(parseResult.GetValue(importModeOpt));
-        var eventsSchema = parseResult.GetValue(importSchemaOpt) ?? "eds_events";
+        var flagMode   = parseResult.GetValue(importModeOpt);
+        var flagSchema = parseResult.GetValue(importSchemaOpt);
+        var noConfirm  = parseResult.GetValue(noConfirmOpt);
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
@@ -819,6 +825,10 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         var driverUrl = urlArg ?? fileConfig["url"];
         var apiKey    = keyArg ?? fileConfig["token"];
+
+        // ── Resolve driver mode: flag vs config.toml, with conflict prompt if they differ ──
+        var driverMode   = await ResolveDriverModeAsync(flagMode,   fileConfig["driver_mode"],   configPath, noConfirm, ct);
+        var eventsSchema = await ResolveEventsSchemaAsync(flagSchema, fileConfig["events_schema"], configPath, ct);
 
         if (string.IsNullOrEmpty(driverUrl))
         {
@@ -880,6 +890,73 @@ static DriverMode ParseDriverMode(string? value) =>
         "timeseries" or "time-series" or "time_series" => DriverMode.TimeSeries,
         _ => DriverMode.Upsert,
     };
+
+/// <summary>
+/// Resolves the effective DriverMode by reconciling the CLI flag with what is persisted in config.toml:
+/// <list type="bullet">
+///   <item>No flag, no config → Upsert (default)</item>
+///   <item>No flag, has config → use the stored value</item>
+///   <item>Flag provided, no config → persist the flag value and use it</item>
+///   <item>Flag provided, config differs → prompt user to confirm the change (unless noConfirm), then persist</item>
+/// </list>
+/// </summary>
+static async Task<DriverMode> ResolveDriverModeAsync(
+    string? flagValue,
+    string? storedValue,
+    string configPath,
+    bool noConfirm = false,
+    CancellationToken ct = default)
+{
+    if (flagValue is null)
+        return ParseDriverMode(storedValue);   // use stored config or default (Upsert)
+
+    var flagMode       = ParseDriverMode(flagValue);
+    var flagNormalized = flagMode == DriverMode.TimeSeries ? "timeseries" : "upsert";
+
+    if (storedValue is not null && storedValue != flagNormalized)
+    {
+        // Flag conflicts with stored config — prompt unless running non-interactively
+        if (!noConfirm)
+        {
+            Log.Warning(
+                "[config] Conflict: config.toml has driver_mode={Stored} but --driver-mode={Flag} was specified.",
+                storedValue, flagNormalized);
+            var confirmed = AnsiConsole.Confirm(
+                $"config.toml has driver_mode=[bold]{storedValue}[/] but you passed " +
+                $"--driver-mode=[bold]{flagNormalized}[/]. Change it?",
+                defaultValue: false);
+            if (!confirmed)
+            {
+                Log.Information("[config] Keeping existing driver_mode={Mode}.", storedValue);
+                return ParseDriverMode(storedValue);
+            }
+        }
+        Log.Information("[config] Updating driver_mode from {Old} to {New}.", storedValue, flagNormalized);
+    }
+
+    await PersistConfigValueAsync(configPath, "driver_mode", flagNormalized);
+    return flagMode;
+}
+
+/// <summary>
+/// Resolves the effective events schema name by reconciling the CLI flag with config.toml.
+/// Persists the value if a flag was provided. No conflict prompt — changing the schema name
+/// is an advanced operation and the flag value is taken as authoritative.
+/// </summary>
+static async Task<string> ResolveEventsSchemaAsync(
+    string? flagValue,
+    string? storedValue,
+    string configPath,
+    CancellationToken ct = default)
+{
+    if (flagValue is null)
+        return storedValue ?? "eds_events";
+
+    if (flagValue != storedValue)
+        await PersistConfigValueAsync(configPath, "events_schema", flagValue);
+
+    return flagValue;
+}
 
 static Command BuildVersionCommand()
 {

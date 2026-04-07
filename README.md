@@ -193,6 +193,8 @@ eds server --driver-mode timeseries
 eds import --driver-mode timeseries --url postgres://user:password@localhost/mydb
 ```
 
+The selected mode is automatically persisted to `config.toml` (`driver_mode = "timeseries"`). On subsequent restarts you can omit the flag and the stored value will be used. If you pass `--driver-mode` with a value that differs from what's in `config.toml`, EDS will prompt you to confirm before changing it. Pass `--no-confirm` to accept the change non-interactively (useful in scripts).
+
 > **Note:** Upsert and time-series data can coexist in the same database. The events tables live in the `eds_events` schema (or use a `__events` suffix in MySQL), keeping them separate from any upsert mirror tables.
 
 ## Driver Connection Strings
