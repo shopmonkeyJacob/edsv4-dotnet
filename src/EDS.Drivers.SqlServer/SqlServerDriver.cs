@@ -167,6 +167,18 @@ public sealed class SqlServerDriver : SqlDriverBase, IDriverHelp
     protected override string BuildAlterAddColumnSql(string table, string col, string sqlType) =>
         $"ALTER TABLE {QuoteId(table)} ADD {QuoteId(col)} {sqlType} NULL;";
 
+    protected override string BuildAlterColumnTypeSql(string table, string col, string sqlType) =>
+        $"ALTER TABLE {QuoteId(table)} ALTER COLUMN {QuoteId(col)} {sqlType} NULL;";
+
+    protected override string BuildDropColumnSql(string table, string col) =>
+        $"ALTER TABLE {QuoteId(table)} DROP COLUMN {QuoteId(col)};";
+
+    protected override string BuildDropTableSql(string table)
+    {
+        var escapedTable = table.Replace("'", "''");
+        return $"IF OBJECT_ID(N'{escapedTable}', N'U') IS NOT NULL DROP TABLE {QuoteId(table)};";
+    }
+
     protected override string PropToSqlType(SchemaProperty prop, bool isPrimaryKey = false) => prop.Type switch
     {
         "string" when isPrimaryKey                => "VARCHAR(64)",

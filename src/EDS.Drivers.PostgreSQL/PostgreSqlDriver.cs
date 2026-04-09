@@ -132,6 +132,15 @@ public sealed class PostgreSqlDriver : SqlDriverBase, IDriverHelp, IDriverAlias
     protected override string BuildAlterAddColumnSql(string table, string col, string sqlType) =>
         $"ALTER TABLE {QuoteId(table)} ADD COLUMN {QuoteId(col)} {sqlType};";
 
+    protected override string BuildAlterColumnTypeSql(string table, string col, string sqlType) =>
+        $"ALTER TABLE {QuoteId(table)} ALTER COLUMN {QuoteId(col)} TYPE {sqlType};";
+
+    protected override string BuildDropColumnSql(string table, string col) =>
+        $"ALTER TABLE {QuoteId(table)} DROP COLUMN {QuoteId(col)};";
+
+    protected override string BuildDropTableSql(string table) =>
+        $"DROP TABLE IF EXISTS {QuoteId(table)};";
+
     protected override string PropToSqlType(SchemaProperty prop, bool isPrimaryKey = false) => prop.Type switch
     {
         "string" when prop.Format == "date-time"  => "TIMESTAMP WITH TIME ZONE",

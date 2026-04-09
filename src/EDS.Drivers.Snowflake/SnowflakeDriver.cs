@@ -179,6 +179,43 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
         await RefreshSchemaAsync(conn, ct);
     }
 
+    public async Task MigrateChangedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> changedColumns, CancellationToken ct = default)
+    {
+        using var conn = new SnowflakeDbConnection { ConnectionString = _connectionString };
+        await conn.OpenAsync(ct);
+
+        foreach (var col in changedColumns)
+        {
+            if (!schema.Properties.TryGetValue(col, out var prop)) continue;
+            var sqlType = PropToSnowflakeSqlType(prop);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"ALTER TABLE {QuoteSnowId(schema.Table)} ALTER COLUMN {QuoteSnowId(col)} SET DATA TYPE {sqlType};";
+            logger.LogInformation("[Snowflake] Altering column type {Column} on {Table} to {Type}.", col, schema.Table, sqlType);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        if (changedColumns.Count > 0)
+            await RefreshSchemaAsync(conn, ct);
+    }
+
+    public async Task MigrateRemovedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> removedColumns, CancellationToken ct = default)
+    {
+        using var conn = new SnowflakeDbConnection { ConnectionString = _connectionString };
+        await conn.OpenAsync(ct);
+
+        foreach (var col in removedColumns)
+        {
+            if (_dbSchema.TryGetValue(schema.Table, out var existing) && !existing.ContainsKey(col)) continue;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"ALTER TABLE {QuoteSnowId(schema.Table)} DROP COLUMN {QuoteSnowId(col)};";
+            logger.LogInformation("[Snowflake] Dropping removed column {Column} from {Table}.", col, schema.Table);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        if (removedColumns.Count > 0)
+            await RefreshSchemaAsync(conn, ct);
+    }
+
     /// <summary>
     /// Builds a <c>CREATE OR REPLACE TABLE</c> statement for the given schema.
     /// Mirrors Go's <c>createSQL</c> function exactly.

@@ -72,8 +72,16 @@ internal sealed class ImportCheckpoint
 
 internal static class ImportService
 {
-    private const string TableExportTrackerKey = "import:table-export";
+    private const string TableExportTrackerKey  = "import:table-export";
     internal const string CheckpointTrackerKey  = "import:checkpoint";
+
+    /// <summary>
+    /// Separate key used by <see cref="EDS.Importer.NdjsonGzImporter"/> to persist the
+    /// set of already-completed filenames as a JSON array. Kept distinct from
+    /// <see cref="CheckpointTrackerKey"/> so that per-file progress updates do not
+    /// overwrite the full <see cref="ImportCheckpoint"/> object.
+    /// </summary>
+    internal const string CompletedFilesTrackerKey = "import:completed-files";
 
     // ── Export job ────────────────────────────────────────────────────────────
 
@@ -243,7 +251,18 @@ internal static class ImportService
         ITracker tracker, CancellationToken ct)
     {
         var json = await tracker.GetKeyAsync(CheckpointTrackerKey, ct);
-        return json is null ? null : JsonSerializer.Deserialize<ImportCheckpoint>(json);
+        if (json is null) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<ImportCheckpoint>(json);
+        }
+        catch
+        {
+            // Stale or incompatible value in the tracker (e.g. a bare JSON array written
+            // by an older build). Treat as no checkpoint so the run starts fresh.
+            await tracker.DeleteKeyAsync(CheckpointTrackerKey, ct);
+            return null;
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

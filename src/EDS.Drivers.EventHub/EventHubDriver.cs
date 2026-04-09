@@ -4,6 +4,7 @@ using EDS.Core.Abstractions;
 using EDS.Core.Helpers;
 using EDS.Core.Models;
 using Microsoft.Extensions.Logging;
+using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 
@@ -14,7 +15,7 @@ namespace EDS.Drivers.EventHub;
 /// Partition key: {table}.{companyId}.{locationId}.{primaryKey}
 /// Events with the same partition key are batched together.
 /// </summary>
-public sealed class EventHubDriver : IDriver, IDriverLifecycle, IDriverHelp
+public sealed class EventHubDriver : IDriver, IDriverLifecycle, IDriverHelp, IDriverDirectImport
 {
     private EventHubProducerClient? _client;
     private readonly List<DbChangeEvent> _pending = new();
@@ -107,6 +108,85 @@ public sealed class EventHubDriver : IDriver, IDriverLifecycle, IDriverHelp
             await _client.DisposeAsync();
             _client = null;
         }
+    }
+
+    // ── IDriverDirectImport ───────────────────────────────────────────────────
+
+    public Task InitForDirectImportAsync(ILogger logger, string url, CancellationToken ct = default)
+    {
+        return StartAsync(new DriverConfig
+        {
+            Url = url, Logger = logger,
+            SchemaRegistry = null!, Tracker = null!, DataDir = string.Empty
+        }, ct);
+    }
+
+    public async Task ImportFilesAsync(
+        ILogger logger,
+        IReadOnlyList<(string Table, string FilePath)> files,
+        CancellationToken ct = default)
+    {
+        long totalRecords = 0;
+
+        foreach (var (table, filePath) in files)
+        {
+            logger.LogInformation("[import] Publishing {File}", Path.GetFileName(filePath));
+            long count = 0;
+
+            await using var fs = File.OpenRead(filePath);
+            Stream stream = filePath.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+                ? new GZipStream(fs, CompressionMode.Decompress)
+                : fs;
+
+            using var reader = new StreamReader(stream, Encoding.UTF8, bufferSize: 65536);
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct)) is not null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                DbChangeEvent evt;
+                try { evt = BuildImportEvent(line, table); }
+                catch (Exception ex)
+                {
+                    logger.LogWarning("[import] Skipping invalid line in {File}: {Error}",
+                        Path.GetFileName(filePath), ex.Message);
+                    continue;
+                }
+
+                var shouldFlush = await ProcessAsync(logger, evt, ct);
+                if (shouldFlush) await FlushAsync(logger, ct);
+                count++;
+            }
+
+            if (_pending.Count > 0) await FlushAsync(logger, ct);
+            logger.LogInformation("[import] {File}: {Count} record(s) published.", Path.GetFileName(filePath), count);
+            totalRecords += count;
+        }
+
+        logger.LogInformation("[import] Published {Total} record(s) to EventHub.", totalRecords);
+    }
+
+    private static DbChangeEvent BuildImportEvent(string json, string table)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var id = root.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String
+            ? idEl.GetString() ?? Guid.NewGuid().ToString()
+            : Guid.NewGuid().ToString();
+        var companyId  = root.TryGetProperty("companyId",  out var compEl)  ? compEl.GetString()  : null;
+        var locationId = root.TryGetProperty("locationId", out var locEl)   ? locEl.GetString()   : null;
+        return new DbChangeEvent
+        {
+            Operation  = "INSERT",
+            Id         = id,
+            Table      = table,
+            Key        = [id],
+            CompanyId  = companyId,
+            LocationId = companyId ?? locationId,
+            After      = JsonSerializer.Deserialize<JsonElement>(json),
+            Timestamp  = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            Imported   = true,
+        };
     }
 
     public IReadOnlyList<DriverField> Configuration() =>

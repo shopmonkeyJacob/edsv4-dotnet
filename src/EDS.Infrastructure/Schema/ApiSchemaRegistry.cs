@@ -67,6 +67,22 @@ public sealed class ApiSchemaRegistry : ISchemaRegistry
     public Task<SchemaMap> GetLatestSchemaAsync(CancellationToken ct = default) =>
         Task.FromResult(_latestSchemas);
 
+    /// <summary>
+    /// Bypasses the 24-hour TTL and immediately re-fetches the full schema catalog from the
+    /// Shopmonkey API. Call this at the start of an import to guarantee the local cache
+    /// reflects the latest HQ schema before any table DDL is executed.
+    /// </summary>
+    public async Task ForceRefreshAsync(CancellationToken ct = default)
+    {
+        _logger.LogInformation("[schema] Force-refreshing schema catalog from HQ (bypassing cache)...");
+        // Expire the timestamp so LoadAllSchemasAsync treats the next call as a cold start.
+        await _tracker.SetKeyAsync(AllSchemasTsKey, DateTimeOffset.MinValue.ToString("O"), ct);
+        _latestSchemas = new SchemaMap();
+        _schemaCache.Clear();
+        _versionCache.Clear();
+        await LoadAllSchemasAsync(ct);
+    }
+
     public async Task<CoreSchema?> GetSchemaAsync(string table, string version, CancellationToken ct = default)
     {
         var cacheKey = GetSchemaCacheKey(table, version);

@@ -77,6 +77,14 @@ public sealed class NdjsonGzImporter
         // Skipped when resuming — tables already exist and are partially populated.
         if (!_config.NoDelete && !isResume)
         {
+            // Drop tables that are in the DB but no longer in the HQ schema (orphans)
+            // before recreating all current schema tables, so the DB ends up fully in sync.
+            if (handler is IDriverImport importDriver)
+            {
+                var knownTables = new HashSet<string>(schemaMap.Keys, StringComparer.OrdinalIgnoreCase);
+                await importDriver.DropOrphanTablesAsync(_logger, knownTables, ct);
+            }
+
             _logger.LogInformation("[import] Dropping and recreating {Count} table(s)...", schemaMap.Count);
             foreach (var (_, schema) in schemaMap)
                 await handler.CreateDatasourceAsync(schema, ct);
@@ -85,6 +93,15 @@ public sealed class NdjsonGzImporter
         {
             _logger.LogInformation("[import] Resuming — skipping table recreation ({N} file(s) already done).",
                 completedFiles.Count);
+            // Reconcile schema: the HQ schema may have gained columns since the tables
+            // were originally created. Add any missing columns before importing rows so
+            // that INSERT statements built from the latest schema don't hit "Unknown column".
+            if (handler is IDriverMigration migration)
+            {
+                _logger.LogDebug("[import] Reconciling schema for {N} table(s)...", schemaMap.Count);
+                foreach (var (_, schema) in schemaMap)
+                    await migration.MigrateNewColumnsAsync(_logger, schema, schema.Columns().ToList(), ct);
+            }
         }
 
         if (_config.SchemaOnly)

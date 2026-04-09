@@ -59,6 +59,27 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// <summary>ALTER TABLE … ADD COLUMN DDL — used by MigrateNewColumnsAsync.</summary>
     protected abstract string BuildAlterAddColumnSql(string table, string col, string sqlType);
 
+    /// <summary>
+    /// ALTER TABLE … ALTER/MODIFY COLUMN DDL — used by MigrateChangedColumnsAsync.
+    /// Return an empty string to skip this dialect (default: no-op).
+    /// </summary>
+    protected virtual string BuildAlterColumnTypeSql(string table, string col, string sqlType) =>
+        string.Empty;
+
+    /// <summary>
+    /// ALTER TABLE … DROP COLUMN DDL — used by MigrateRemovedColumnsAsync.
+    /// Default: standard SQL syntax shared by MySQL and PostgreSQL.
+    /// </summary>
+    protected virtual string BuildDropColumnSql(string table, string col) =>
+        $"ALTER TABLE {QuoteId(table)} DROP COLUMN {QuoteId(col)};";
+
+    /// <summary>
+    /// DROP TABLE DDL — used by DropOrphanTablesAsync.
+    /// Default: standard IF NOT EXISTS syntax. Override for dialects that differ (e.g. SQL Server).
+    /// </summary>
+    protected virtual string BuildDropTableSql(string table) =>
+        $"DROP TABLE IF EXISTS {QuoteId(table)};";
+
     /// <summary>Maps a SchemaProperty to its SQL column type for this dialect.</summary>
     protected abstract string PropToSqlType(SchemaProperty prop, bool isPrimaryKey = false);
 
@@ -270,6 +291,43 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         await RefreshSchemaAsync(conn2, ct);
     }
 
+    public async Task MigrateChangedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> changedColumns, CancellationToken ct = default)
+    {
+        if (Mode == DriverMode.TimeSeries) return;
+
+        await using var conn = await OpenConnectionAsync(ct);
+        foreach (var col in changedColumns)
+        {
+            if (!schema.Properties.TryGetValue(col, out var prop)) continue;
+            var sql = BuildAlterColumnTypeSql(schema.Table, col, PropToSqlType(prop, isPrimaryKey: false));
+            if (string.IsNullOrEmpty(sql)) continue;
+            logger.LogInformation("[{Driver}] Altering column type {Column} on {Table}.", GetType().Name, col, schema.Table);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        if (changedColumns.Count > 0)
+            await RefreshSchemaAsync(conn, ct);
+    }
+
+    public async Task MigrateRemovedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> removedColumns, CancellationToken ct = default)
+    {
+        if (Mode == DriverMode.TimeSeries) return;
+
+        await using var conn = await OpenConnectionAsync(ct);
+        foreach (var col in removedColumns)
+        {
+            if (DbSchema.TryGetValue(schema.Table, out var dbCols) && !dbCols.ContainsKey(col)) continue;
+            var sql = BuildDropColumnSql(schema.Table, col);
+            logger.LogInformation("[{Driver}] Dropping removed column {Column} from {Table}.", GetType().Name, col, schema.Table);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        if (removedColumns.Count > 0)
+            await RefreshSchemaAsync(conn, ct);
+    }
+
     // ── Shared internals ──────────────────────────────────────────────────────
 
     protected async Task RefreshSchemaAsync(DbConnection conn, CancellationToken ct)
@@ -463,6 +521,29 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         await RefreshSchemaAsync(conn, ct);
     }
 
+    /// <summary>Drops tables in the DB that are not in <paramref name="knownTables"/>.</summary>
+    public async Task DropOrphanTablesAsync(ILogger logger, IReadOnlySet<string> knownTables, CancellationToken ct = default)
+    {
+        var orphans = DbSchema.Keys
+            .Where(t => !knownTables.Contains(t))
+            .ToList();
+
+        if (orphans.Count == 0) return;
+
+        logger.LogInformation("[{Driver}] Dropping {Count} orphan table(s) not in current HQ schema: {Tables}",
+            GetType().Name, orphans.Count, string.Join(", ", orphans));
+
+        await using var conn = await OpenConnectionAsync(ct);
+        foreach (var table in orphans)
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = BuildDropTableSql(table);
+            await cmd.ExecuteNonQueryAsync(ct);
+            logger.LogDebug("[{Driver}] Dropped orphan table {Table}.", GetType().Name, table);
+        }
+        await RefreshSchemaAsync(conn, ct);
+    }
+
     /// <summary>Drops and recreates the table — called once per table before rows arrive.</summary>
     public Task CreateDatasourceAsync(Schema schema, CancellationToken ct = default) =>
         MigrateNewTableAsync(Logger!, schema, ct);
@@ -476,7 +557,33 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// </summary>
     public async Task ImportEventAsync(DbChangeEvent evt, Schema schema, CancellationToken ct = default)
     {
-        var sql = BuildSql(evt, schema);
+        // Guard against schema drift: only INSERT columns that actually exist in the DB.
+        // On a resumed import the DB table may lack columns that were added to the HQ
+        // schema after the table was originally created. Skip unknown columns rather than
+        // failing the entire batch — the schema reconciliation in NdjsonGzImporter will
+        // have added them, but this acts as a safety net.
+        Schema effectiveSchema = schema;
+        if (DbSchema.TryGetValue(schema.Table, out var dbCols))
+        {
+            var unknown = schema.Columns().Where(c => !dbCols.ContainsKey(c)).ToList();
+            if (unknown.Count > 0)
+            {
+                Logger?.LogDebug(
+                    "[import] {Table}: skipping {N} column(s) not yet in DB: {Cols}",
+                    schema.Table, unknown.Count, string.Join(", ", unknown));
+                effectiveSchema = new Schema
+                {
+                    Table        = schema.Table,
+                    ModelVersion = schema.ModelVersion,
+                    PrimaryKeys  = schema.PrimaryKeys,
+                    Required     = schema.Required,
+                    Properties   = schema.Properties
+                        .Where(kv => dbCols.ContainsKey(kv.Key))
+                        .ToDictionary(kv => kv.Key, kv => kv.Value),
+                };
+            }
+        }
+        var sql = BuildSql(evt, effectiveSchema);
         _pending.Append(sql);
         _count++;
         if (_count >= ImportBatchSize)

@@ -539,6 +539,10 @@ static async Task<bool> RunImportPipelineAsync(
     var schemaRegistry = await EDS.Infrastructure.Schema.ApiSchemaRegistry.CreateAsync(
         tracker, schemaLogger, apiUrl, EdsVersion.Current, ct);
 
+    // Gap 1: Always fetch the latest schema from HQ before import so that the local
+    // cache never causes table DDL to be built from a stale schema (bypasses 24h TTL).
+    await schemaRegistry.ForceRefreshAsync(ct);
+
     // ── Test driver connectivity ──────────────────────────────────────────────
     var importLogger = loggerFactory.CreateLogger("import");
     Log.Information("[import] Testing driver connection...");
@@ -585,7 +589,25 @@ static async Task<bool> RunImportPipelineAsync(
         }
         else
         {
-            completedFiles = new HashSet<string>(existingCheckpoint.CompletedFiles, StringComparer.OrdinalIgnoreCase);
+            // Load per-file progress from the dedicated completed-files key (written by
+            // NdjsonGzImporter). Fall back to the embedded list for checkpoints created
+            // before this key was introduced.
+            var completedFilesJson = await tracker.GetKeyAsync(ImportService.CompletedFilesTrackerKey, ct);
+            if (completedFilesJson is not null)
+            {
+                try
+                {
+                    var saved = System.Text.Json.JsonSerializer.Deserialize<HashSet<string>>(completedFilesJson);
+                    if (saved is not null)
+                        completedFiles = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
+                }
+                catch { /* corrupt entry — start with empty set */ }
+            }
+            else
+            {
+                completedFiles = new HashSet<string>(existingCheckpoint.CompletedFiles, StringComparer.OrdinalIgnoreCase);
+            }
+
             Log.Information("[import] Resuming import job {JobId} — {N} file(s) already done.",
                 existingCheckpoint.JobId, completedFiles.Count);
         }
@@ -612,8 +634,23 @@ static async Task<bool> RunImportPipelineAsync(
             Directory.CreateDirectory(downloadDir);
         }
 
-        tableInfos = await ImportService.TryLoadTableExportInfoAsync(tracker, ct);
         Log.Information("[import] Resuming import job {JobId} from: {Dir}", jobId, downloadDir);
+
+        // If no files were downloaded yet (interrupted during export polling or download),
+        // re-poll the same job and download before proceeding to the row import.
+        var hasFiles = Directory.EnumerateFiles(downloadDir, "*.ndjson*", SearchOption.AllDirectories).Any();
+        if (!hasFiles && !string.IsNullOrEmpty(jobId))
+        {
+            var exportLogger = loggerFactory.CreateLogger("import.export");
+            Log.Information("[import] No downloaded files found — re-polling export job {JobId}...", jobId);
+            var job = await ImportService.PollUntilCompleteAsync(apiUrl, opts.ApiKey, jobId!, exportLogger, ct);
+            Log.Information("[import] Downloading export data...");
+            tableInfos = await ImportService.BulkDownloadAsync(job, downloadDir, exportLogger, ct);
+        }
+        else
+        {
+            tableInfos = await ImportService.TryLoadTableExportInfoAsync(tracker, ct);
+        }
     }
     else if (!string.IsNullOrEmpty(opts.Dir))
     {
@@ -677,7 +714,7 @@ static async Task<bool> RunImportPipelineAsync(
     // ── Update checkpoint with completed download state ───────────────────────
     // Written again here to record the final downloadDir and any completedFiles
     // carried over from a previous --resume run.
-    var checkpointKey = ImportService.CheckpointTrackerKey;
+    var checkpointKey = ImportService.CompletedFilesTrackerKey;
     if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
     {
         var checkpoint = new ImportCheckpoint
@@ -769,7 +806,10 @@ static async Task<bool> RunImportPipelineAsync(
     // A completed import doesn't need to be resumed, so remove the checkpoint
     // to avoid accidentally resuming a stale run next time.
     if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
-        await tracker.DeleteKeyAsync(checkpointKey, ct);
+    {
+        await tracker.DeleteKeyAsync(ImportService.CheckpointTrackerKey, ct);
+        await tracker.DeleteKeyAsync(ImportService.CompletedFilesTrackerKey, ct);
+    }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     if (cleanupDir && Directory.Exists(downloadDir))

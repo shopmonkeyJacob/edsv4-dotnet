@@ -104,6 +104,20 @@ public interface IDriverMigration
 {
     Task MigrateNewTableAsync(ILogger logger, Schema schema, CancellationToken ct = default);
     Task MigrateNewColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> newColumns, CancellationToken ct = default);
+
+    /// <summary>
+    /// Alters the type of columns that have changed in the HQ schema.
+    /// Default: no-op (override in drivers that support ALTER COLUMN).
+    /// </summary>
+    Task MigrateChangedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> changedColumns, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    /// <summary>
+    /// Drops columns that have been removed from the HQ schema.
+    /// Default: no-op (override in drivers that support DROP COLUMN).
+    /// </summary>
+    Task MigrateRemovedColumnsAsync(ILogger logger, Schema schema, IReadOnlyList<string> removedColumns, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
 /// <summary>
@@ -139,6 +153,15 @@ public interface IDriverImport : IImportHandler
         DriverMode mode = DriverMode.Upsert,
         string eventsSchema = "eds_events",
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Drops tables that exist in the destination database but are not in
+    /// <paramref name="knownTables"/> (the current HQ schema). Called before
+    /// table recreation on a fresh (non-resume) import so the DB is fully in sync.
+    /// Default: no-op.
+    /// </summary>
+    Task DropOrphanTablesAsync(ILogger logger, IReadOnlySet<string> knownTables, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }
 
 /// <summary>

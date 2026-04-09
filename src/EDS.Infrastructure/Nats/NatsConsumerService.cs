@@ -580,9 +580,10 @@ public sealed class NatsConsumerService : BackgroundService
         var newSchema = await registry.GetSchemaAsync(evt.Table, modelVersion, ct);
         if (newSchema is null)
         {
-            _logger.LogWarning("[consumer] Schema not found for {Table} v{Version}. Skipping migration.",
-                evt.Table, modelVersion);
-            return false;
+            // HQ is unreachable or returned an unexpected response — NAK the event so
+            // it is retried once the schema is available again.
+            throw new InvalidOperationException(
+                $"Schema not available for {evt.Table} v{modelVersion}. NAKing event for retry.");
         }
 
         if (!found)
@@ -594,7 +595,7 @@ public sealed class NatsConsumerService : BackgroundService
             return true;
         }
 
-        // Table exists but model version changed — find new columns
+        // Table exists but model version changed — diff old vs new schema
         var oldSchema = await registry.GetSchemaAsync(evt.Table, currentVersion, ct);
         if (oldSchema is not null)
         {
@@ -607,6 +608,30 @@ public sealed class NatsConsumerService : BackgroundService
                 _logger.LogInformation("[consumer] Migrating {Count} new column(s) for {Table} v{Version}: {Columns}",
                     newCols.Count, evt.Table, modelVersion, string.Join(", ", newCols));
                 await migration.MigrateNewColumnsAsync(_logger, newSchema, newCols, ct);
+            }
+
+            var changedCols = newSchema.Columns()
+                .Where(c => oldSchema.Properties.TryGetValue(c, out var oldProp) &&
+                            (oldProp.Type != newSchema.Properties[c].Type ||
+                             oldProp.Format != newSchema.Properties[c].Format))
+                .ToList();
+
+            if (changedCols.Count > 0)
+            {
+                _logger.LogInformation("[consumer] Migrating {Count} changed column type(s) for {Table} v{Version}: {Columns}",
+                    changedCols.Count, evt.Table, modelVersion, string.Join(", ", changedCols));
+                await migration.MigrateChangedColumnsAsync(_logger, newSchema, changedCols, ct);
+            }
+
+            var removedCols = oldSchema.Columns()
+                .Where(c => !newSchema.Properties.ContainsKey(c))
+                .ToList();
+
+            if (removedCols.Count > 0)
+            {
+                _logger.LogInformation("[consumer] Dropping {Count} removed column(s) for {Table} v{Version}: {Columns}",
+                    removedCols.Count, evt.Table, modelVersion, string.Join(", ", removedCols));
+                await migration.MigrateRemovedColumnsAsync(_logger, newSchema, removedCols, ct);
             }
         }
 
