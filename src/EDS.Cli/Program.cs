@@ -165,8 +165,10 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 }
 
 /// <summary>
-/// Core server startup — loads config, establishes a NATS session, and runs the host.
-/// Called by both the server command and the import command (post-import transition).
+/// Core server startup — loads config, then loops: start HQ session → run host → renew.
+/// On IntentionalRestart (renewal timer, HQ restart notification) the session is ended and
+/// a new one is started in-process without requiring a process manager.
+/// Upgrade exits the process so the replacement binary on disk is executed.
 /// </summary>
 static async Task RunServerAsync(
     string configPath,
@@ -178,7 +180,7 @@ static async Task RunServerAsync(
     string eventsSchema = "eds_events",
     CancellationToken ct = default)
 {
-    // ── Load config ───────────────────────────────────────────────────────────
+    // ── One-time setup (shared across session renewals) ───────────────────────
     var config = new ConfigurationBuilder()
         .AddTomlFile(configPath, optional: true)
         .AddEnvironmentVariables("EDS_")
@@ -194,286 +196,293 @@ static async Task RunServerAsync(
         return;
     }
 
-    // ── Resolve API + NATS URLs from JWT ──────────────────────────────────────
     var apiUrl  = SessionService.GetApiUrlFromJwt(apiKey);
     var natsUrl = SessionService.GetNatsUrl(apiUrl, config["server"]);
     Log.Information("[server] using API url: {ApiUrl}", apiUrl);
 
-    // ── Build shared state + start schema fetch in parallel with session ──────
     var registry = BuildDriverRegistry();
 
-    Task<EDS.Infrastructure.Schema.ApiSchemaRegistry>? schemaTask = null;
+    // Schema registry is fetched once and reused across session renewals.
+    EDS.Infrastructure.Schema.ApiSchemaRegistry? schemaRegistry = null;
     if (!string.IsNullOrEmpty(driverUrl))
     {
         var earlyFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(b => b.AddSerilog(Log.Logger));
         var schemaLogger = new Microsoft.Extensions.Logging.Logger<EDS.Infrastructure.Schema.ApiSchemaRegistry>(earlyFactory);
-        schemaTask = EDS.Infrastructure.Schema.ApiSchemaRegistry.CreateAsync(
+        schemaRegistry = await EDS.Infrastructure.Schema.ApiSchemaRegistry.CreateAsync(
             tracker, schemaLogger, apiUrl, EdsVersion.Current, ct);
     }
 
-    // ── Start a new session with HQ ───────────────────────────────────────────
-    // Always call SendStartAsync on every startup so HQ clears completedDate
-    // and marks the session as active. This mirrors the Go binary, which has
-    // no credential-resume shortcut and always sends a session-start signal.
-    string sessionId, credsFile;
-    while (true)
+    // ── Session restart loop ──────────────────────────────────────────────────
+    // Each iteration represents one HQ session. On IntentionalRestart (renew interval
+    // or HQ restart notification), the old session is ended and a new one begins.
+    while (!ct.IsCancellationRequested)
     {
-        try
+        // ── Start a new session with HQ ───────────────────────────────────────
+        string sessionId, credsFile;
+        while (true)
         {
-            (sessionId, credsFile) = await SessionService.SendStartAsync(
-                apiUrl, apiKey, serverId, driverUrl, dataDir, registry, ct);
-            break;
-        }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("already running"))
-        {
-            Log.Information("[server] {Message}", ex.Message);
-            await Task.Delay(TimeSpan.FromSeconds(5), ct);
-        }
-    }
-    await tracker.SetKeyAsync(SessionService.LastCredsFileKey, credsFile, ct);
-
-    var schemaRegistry = schemaTask is not null ? await schemaTask : null;
-
-    Log.Information("[server] session started: {SessionId}", sessionId);
-
-    if (string.IsNullOrEmpty(driverUrl))
-        Log.Information("[server] Return to HQ and continue with configuring your server.");
-
-    // ── Build and run host ────────────────────────────────────────────────────
-    // Log file is named after the session ID and always captures Debug so the full
-    // picture is preserved regardless of whether --verbose was passed.
-    var serverLogFile = Path.Combine(dataDir, $"{sessionId}.log");
-    Log.Information("[server] Session log: {LogFile}", serverLogFile);
-
-    // CTS used to cancel any background import that was started by a notification
-    // handler. Cancelled during ApplicationStopping so imports don't outlive the host.
-    var backgroundImportCts = new CancellationTokenSource();
-
-    // Build the handlers object before the host so we can set the five handlers
-    // that require IHostApplicationLifetime or NatsConsumerService (available only
-    // after host.Build()) by mutating the same reference the NotificationService holds.
-    var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts, driverMode, eventsSchema);
-
-    var host = Host.CreateDefaultBuilder()
-        .UseSerilog((_, __, lc) => lc
-            .MinimumLevel.Debug()
-            .Enrich.FromLogContext()
-            // Console: Information+ normally; Debug+ when --verbose.
-            .WriteTo.Console(
-                restrictedToMinimumLevel: verbose
-                    ? Serilog.Events.LogEventLevel.Debug
-                    : Serilog.Events.LogEventLevel.Information,
-                outputTemplate: ConsoleTemplate)
-            // File: always Debug — full detail, regardless of --verbose.
-            .WriteTo.File(
-                serverLogFile,
-                restrictedToMinimumLevel: Serilog.Events.LogEventLevel.Debug,
-                outputTemplate: FileTemplate,
-                rollingInterval: RollingInterval.Day,
-                retainedFileCountLimit: 7))
-        .ConfigureAppConfiguration(b => b
-            .AddTomlFile(configPath, optional: true)
-            .AddEnvironmentVariables("EDS_"))
-        .ConfigureServices((ctx, svc) =>
-        {
-            svc.Configure<MetricsOptions>(ctx.Configuration.GetSection("metrics"));
-            svc.AddSingleton<EDS.Infrastructure.Metrics.StatusProvider>();
-            svc.AddHostedService<MetricsServer>();
-            svc.AddSingleton(registry);
-            svc.AddSingleton<EDS.Infrastructure.Tracking.SqliteTracker>(_ => tracker);
-            svc.AddSingleton<EDS.Core.Abstractions.ITracker>(_ => tracker);
-
-            svc.AddHostedService(sp => new EDS.Infrastructure.Notification.NotificationService(
-                natsUrl,
-                credsFile,
-                sessionId,
-                handlers,
-                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
-                    EDS.Infrastructure.Notification.NotificationService>>()));
-
-            if (!string.IsNullOrEmpty(driverUrl))
+            try
             {
-                svc.AddSingleton<EDS.Core.Abstractions.ISchemaRegistry>(_ => schemaRegistry!);
-
-                var scheme = new Uri(driverUrl).Scheme;
-                var driver = registry.Resolve(scheme)
-                    ?? throw new InvalidOperationException($"No driver registered for scheme '{scheme}'.");
-                svc.AddSingleton<EDS.Core.Abstractions.IDriver>(_ => driver);
-
-                svc.AddSingleton<EDS.Infrastructure.Nats.ConsumerConfig>(sp =>
-                {
-                    var t             = sp.GetRequiredService<EDS.Core.Abstractions.ITracker>();
-                    var schemaReg     = sp.GetRequiredService<EDS.Core.Abstractions.ISchemaRegistry>();
-                    var driverLogger  = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
-                        EDS.Infrastructure.Nats.NatsConsumerService>>();
-                    return new EDS.Infrastructure.Nats.ConsumerConfig
-                    {
-                        Url             = natsUrl,
-                        CredentialsFile = credsFile,
-                        Registry        = schemaReg,
-                        DriverConfig    = new EDS.Core.Abstractions.DriverConfig
-                        {
-                            Url            = driverUrl,
-                            Logger         = driverLogger,
-                            SchemaRegistry = schemaReg,
-                            Tracker        = t,
-                            DataDir        = dataDir,
-                            Mode           = driverMode,
-                            EventsSchema   = eventsSchema,
-                        }
-                    };
-                });
-
-                svc.AddHostedService<EDS.Infrastructure.Nats.NatsConsumerService>();
+                (sessionId, credsFile) = await SessionService.SendStartAsync(
+                    apiUrl, apiKey, serverId, driverUrl, dataDir, registry, ct);
+                break;
             }
-        }).Build();
-
-    var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
-
-    // ── Populate status provider ──────────────────────────────────────────────
-    var statusProvider = host.Services.GetRequiredService<EDS.Infrastructure.Metrics.StatusProvider>();
-    statusProvider.Version   = EdsVersion.Current;
-    statusProvider.SessionId = sessionId;
-    statusProvider.Driver    = EDS.Infrastructure.Metrics.StatusProvider.SanitizeUrl(driverUrl);
-
-    // ── Wire handlers that need host services ─────────────────────────────────
-    // NotificationHandlers is a class (reference type), so mutating it here is
-    // immediately visible to the NotificationService that holds the same reference.
-
-    handlers.Shutdown = (message, deleted) =>
-    {
-        if (deleted)
-            Log.Warning("[server] Server removed from Shopmonkey HQ: {Message}", message);
-        else
-            Log.Information("[server] Shutdown requested from HQ: {Message}", message);
-        lifetime.StopApplication();
-        return Task.CompletedTask;
-    };
-
-    handlers.Restart = () =>
-    {
-        Log.Information("[server] Restart requested from HQ. Stopping — process manager should restart.");
-        Environment.ExitCode = EdsExitCodes.IntentionalRestart;
-        lifetime.StopApplication();
-        return Task.CompletedTask;
-    };
-
-    handlers.Upgrade = async (version) =>
-    {
-        Log.Information("[server] Upgrade to version {Version} requested from HQ.", version);
-        try
-        {
-            // Validate version string before embedding in URL to prevent path traversal.
-            // Acceptable: "1.2.3", "1.2.3-rc", "0.9.0-beta.1", etc.
-            if (!System.Text.RegularExpressions.Regex.IsMatch(version, @"^[\w.\-]+$")
-                || version.Contains(".."))
-                throw new ArgumentException($"Invalid version string: '{version}'.");
-
-            var platform    = GetPlatformId();
-            var currentExe  = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
-                ?? throw new InvalidOperationException("Cannot determine current executable path.");
-            var upgradeBase = $"https://download.shopmonkey.cloud/eds/{version}";
-            var upgradeConfig = new EDS.Infrastructure.Upgrade.UpgradeConfig
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already running"))
             {
-                BinaryUrl       = $"{upgradeBase}/eds-{platform}.tar.gz",
-                SignatureUrl    = $"{upgradeBase}/eds-{platform}.tar.gz.sig",
-                PublicKey       = EdsVersion.ShopmonkeyPublicPgpKey,
-                DestinationPath = currentExe,
-            };
-            using var upgradeFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
-                b => b.AddSerilog(Log.Logger));
-            var upgradeLogger = new Microsoft.Extensions.Logging.Logger<EDS.Infrastructure.Upgrade.UpgradeService>(upgradeFactory);
-            var upgradeService = new EDS.Infrastructure.Upgrade.UpgradeService(
-                upgradeLogger, new HttpClient { Timeout = TimeSpan.FromMinutes(10) });
-            await upgradeService.UpgradeAsync(upgradeConfig, CancellationToken.None);
-            Log.Information("[server] Upgrade to {Version} complete. Restarting...", version);
+                Log.Information("[server] {Message}", ex.Message);
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            }
+        }
+        await tracker.SetKeyAsync(SessionService.LastCredsFileKey, credsFile, ct);
+
+        Log.Information("[server] session started: {SessionId}", sessionId);
+
+        if (string.IsNullOrEmpty(driverUrl))
+            Log.Information("[server] Return to HQ and continue with configuring your server.");
+
+        // ── Build and run host ────────────────────────────────────────────────
+        var serverLogFile = Path.Combine(dataDir, $"{sessionId}.log");
+        Log.Information("[server] Session log: {LogFile}", serverLogFile);
+
+        var backgroundImportCts = new CancellationTokenSource();
+        var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts, driverMode, eventsSchema);
+
+        // exitProcess: set by upgrade handler so the loop exits after session end,
+        // allowing the replacement binary on disk to be executed by a process manager.
+        var exitProcess = false;
+
+        var host = Host.CreateDefaultBuilder()
+            .UseSerilog((_, __, lc) => lc
+                .MinimumLevel.Debug()
+                .Enrich.FromLogContext()
+                .WriteTo.Console(
+                    restrictedToMinimumLevel: verbose
+                        ? Serilog.Events.LogEventLevel.Debug
+                        : Serilog.Events.LogEventLevel.Information,
+                    outputTemplate: ConsoleTemplate)
+                .WriteTo.File(
+                    serverLogFile,
+                    restrictedToMinimumLevel: Serilog.Events.LogEventLevel.Debug,
+                    outputTemplate: FileTemplate,
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 7))
+            .ConfigureAppConfiguration(b => b
+                .AddTomlFile(configPath, optional: true)
+                .AddEnvironmentVariables("EDS_"))
+            .ConfigureServices((ctx, svc) =>
+            {
+                svc.Configure<MetricsOptions>(ctx.Configuration.GetSection("metrics"));
+                svc.AddSingleton<EDS.Infrastructure.Metrics.StatusProvider>();
+                svc.AddHostedService<MetricsServer>();
+                svc.AddSingleton(registry);
+                svc.AddSingleton<EDS.Infrastructure.Tracking.SqliteTracker>(_ => tracker);
+                svc.AddSingleton<EDS.Core.Abstractions.ITracker>(_ => tracker);
+
+                svc.AddHostedService(sp => new EDS.Infrastructure.Notification.NotificationService(
+                    natsUrl,
+                    credsFile,
+                    sessionId,
+                    handlers,
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
+                        EDS.Infrastructure.Notification.NotificationService>>()));
+
+                if (!string.IsNullOrEmpty(driverUrl))
+                {
+                    svc.AddSingleton<EDS.Core.Abstractions.ISchemaRegistry>(_ => schemaRegistry!);
+
+                    var scheme = new Uri(driverUrl).Scheme;
+                    var driver = registry.Resolve(scheme)
+                        ?? throw new InvalidOperationException($"No driver registered for scheme '{scheme}'.");
+                    svc.AddSingleton<EDS.Core.Abstractions.IDriver>(_ => driver);
+
+                    svc.AddSingleton<EDS.Infrastructure.Nats.ConsumerConfig>(sp =>
+                    {
+                        var t             = sp.GetRequiredService<EDS.Core.Abstractions.ITracker>();
+                        var schemaReg     = sp.GetRequiredService<EDS.Core.Abstractions.ISchemaRegistry>();
+                        var driverLogger  = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
+                            EDS.Infrastructure.Nats.NatsConsumerService>>();
+                        var exportInfos   = ImportService.TryLoadTableExportInfoAsync(t, CancellationToken.None)
+                                                .GetAwaiter().GetResult();
+                        var exportTs      = exportInfos is not null
+                            ? exportInfos.ToDictionary(i => i.Table, i => i.Timestamp)
+                            : new Dictionary<string, DateTimeOffset>();
+                        return new EDS.Infrastructure.Nats.ConsumerConfig
+                        {
+                            Url                   = natsUrl,
+                            CredentialsFile       = credsFile,
+                            Registry              = schemaReg,
+                            ExportTableTimestamps = exportTs,
+                            DriverConfig          = new EDS.Core.Abstractions.DriverConfig
+                            {
+                                Url            = driverUrl,
+                                Logger         = driverLogger,
+                                SchemaRegistry = schemaReg,
+                                Tracker        = t,
+                                DataDir        = dataDir,
+                                Mode           = driverMode,
+                                EventsSchema   = eventsSchema,
+                            }
+                        };
+                    });
+
+                    svc.AddHostedService<EDS.Infrastructure.Nats.NatsConsumerService>();
+                }
+            }).Build();
+
+        var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+
+        var statusProvider = host.Services.GetRequiredService<EDS.Infrastructure.Metrics.StatusProvider>();
+        statusProvider.Version   = EdsVersion.Current;
+        statusProvider.SessionId = sessionId;
+        statusProvider.Driver    = EDS.Infrastructure.Metrics.StatusProvider.SanitizeUrl(driverUrl);
+
+        handlers.Shutdown = (message, deleted) =>
+        {
+            if (deleted)
+                Log.Warning("[server] Server removed from Shopmonkey HQ: {Message}", message);
+            else
+                Log.Information("[server] Shutdown requested from HQ: {Message}", message);
+            lifetime.StopApplication();
+            return Task.CompletedTask;
+        };
+
+        handlers.Restart = () =>
+        {
+            Log.Information("[server] Restart requested from HQ — renewing session.");
             Environment.ExitCode = EdsExitCodes.IntentionalRestart;
             lifetime.StopApplication();
-            return new EDS.Infrastructure.Notification.UpgradeResponse(Success: true, Error: null);
-        }
-        catch (Exception ex)
+            return Task.CompletedTask;
+        };
+
+        handlers.Upgrade = async (version) =>
         {
-            Log.Error(ex, "[server] Upgrade to version {Version} failed.", version);
-            return new EDS.Infrastructure.Notification.UpgradeResponse(Success: false, Error: ex.Message);
-        }
-    };
-
-    // Pause/Unpause delegate to the NatsConsumerService if one is running.
-    var consumer = host.Services.GetServices<IHostedService>()
-        .OfType<EDS.Infrastructure.Nats.NatsConsumerService>()
-        .FirstOrDefault();
-    if (consumer is not null)
-    {
-        handlers.Pause   = () => { consumer.SetPaused(true);  return Task.CompletedTask; };
-        handlers.Unpause = () => { consumer.SetPaused(false); return Task.CompletedTask; };
-    }
-    else
-    {
-        Log.Debug("[server] No NATS consumer registered — Pause/Unpause notifications will be ignored.");
-    }
-
-    lifetime.ApplicationStopping.Register(() =>
-    {
-        // Cancel any in-flight background import so it stops cleanly.
-        backgroundImportCts.Cancel();
-
-        // Upload logs to HQ before saying goodbye (best-effort).
-        SessionService.SendLogsAsync(apiUrl, apiKey, sessionId, dataDir, CancellationToken.None)
-            .GetAwaiter().GetResult();
-
-        SessionService.SendEndAsync(apiUrl, apiKey, sessionId, errored: false,
-            CancellationToken.None).GetAwaiter().GetResult();
-        Log.Information("[server] session ended: {SessionId}", sessionId);
-    });
-
-    // ── Background: scheduled session renewal ────────────────────────────────
-    // Mirrors the Go implementation's --renew-interval flag (default 24h).
-    // Stops the host on the interval so the process manager can restart with a
-    // fresh HQ session and new NATS credentials regardless of expiry time.
-    Log.Debug("[server] Session renewal scheduled every {Hours}h.", renewInterval.TotalHours);
-    _ = Task.Run(async () =>
-    {
-        try
-        {
-            await Task.Delay(renewInterval, ct);
-            if (!ct.IsCancellationRequested)
+            Log.Information("[server] Upgrade to version {Version} requested from HQ.", version);
+            try
             {
-                Log.Information("[server] Renew interval elapsed ({Hours}h) — stopping for session renewal.",
-                    renewInterval.TotalHours);
+                if (!System.Text.RegularExpressions.Regex.IsMatch(version, @"^[\w.\-]+$")
+                    || version.Contains(".."))
+                    throw new ArgumentException($"Invalid version string: '{version}'.");
+
+                var platform    = GetPlatformId();
+                var currentExe  = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
+                    ?? throw new InvalidOperationException("Cannot determine current executable path.");
+                var upgradeBase = $"https://download.shopmonkey.cloud/eds/{version}";
+                var upgradeConfig = new EDS.Infrastructure.Upgrade.UpgradeConfig
+                {
+                    BinaryUrl       = $"{upgradeBase}/eds-{platform}.tar.gz",
+                    SignatureUrl    = $"{upgradeBase}/eds-{platform}.tar.gz.sig",
+                    PublicKey       = EdsVersion.ShopmonkeyPublicPgpKey,
+                    DestinationPath = currentExe,
+                };
+                using var upgradeFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+                    b => b.AddSerilog(Log.Logger));
+                var upgradeLogger = new Microsoft.Extensions.Logging.Logger<EDS.Infrastructure.Upgrade.UpgradeService>(upgradeFactory);
+                var upgradeService = new EDS.Infrastructure.Upgrade.UpgradeService(
+                    upgradeLogger, new HttpClient { Timeout = TimeSpan.FromMinutes(10) });
+                await upgradeService.UpgradeAsync(upgradeConfig, CancellationToken.None);
+                Log.Information("[server] Upgrade to {Version} complete. Restarting...", version);
+                // exitProcess=true so the loop exits after session end, allowing the
+                // process manager (or user) to relaunch the replacement binary.
+                exitProcess = true;
                 Environment.ExitCode = EdsExitCodes.IntentionalRestart;
                 lifetime.StopApplication();
+                return new EDS.Infrastructure.Notification.UpgradeResponse(Success: true, Error: null);
             }
-        }
-        catch (OperationCanceledException) { /* normal shutdown */ }
-    }, ct);
-
-    // ── Background: credential expiry watcher ────────────────────────────────
-    // Re-establishes the session when the NATS credential is within 1 hour of
-    // expiring. Stops the host so the process manager can restart with fresh creds.
-    _ = Task.Run(async () =>
-    {
-        try
-        {
-            while (!ct.IsCancellationRequested)
+            catch (Exception ex)
             {
-                await Task.Delay(TimeSpan.FromMinutes(15), ct);
-                var expiry    = SessionService.GetCredentialExpiry(credsFile);
-                var remaining = expiry - DateTimeOffset.UtcNow;
-                if (remaining <= TimeSpan.FromHours(1))
-                {
-                    Log.Warning("[server] NATS credential expires in {Minutes} min — stopping for renewal.",
-                        (int)remaining.TotalMinutes < 0 ? 0 : (int)remaining.TotalMinutes);
-                    lifetime.StopApplication();
-                    return;
-                }
-                Log.Debug("[server] NATS credential valid for {Hours}h {Min}m.",
-                    (int)remaining.TotalHours, remaining.Minutes);
+                Log.Error(ex, "[server] Upgrade to version {Version} failed.", version);
+                return new EDS.Infrastructure.Notification.UpgradeResponse(Success: false, Error: ex.Message);
             }
-        }
-        catch (OperationCanceledException) { /* normal shutdown */ }
-    }, ct);
+        };
 
-    await host.RunAsync(ct);
+        var consumer = host.Services.GetServices<IHostedService>()
+            .OfType<EDS.Infrastructure.Nats.NatsConsumerService>()
+            .FirstOrDefault();
+        if (consumer is not null)
+        {
+            handlers.Pause   = () => { consumer.SetPaused(true);  return Task.CompletedTask; };
+            handlers.Unpause = () => { consumer.SetPaused(false); return Task.CompletedTask; };
+        }
+        else
+        {
+            Log.Debug("[server] No NATS consumer registered — Pause/Unpause notifications will be ignored.");
+        }
+
+        lifetime.ApplicationStopping.Register(() =>
+        {
+            backgroundImportCts.Cancel();
+            SessionService.SendLogsAsync(apiUrl, apiKey, sessionId, dataDir, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            SessionService.SendEndAsync(apiUrl, apiKey, sessionId, errored: false,
+                CancellationToken.None).GetAwaiter().GetResult();
+            Log.Information("[server] session ended: {SessionId}", sessionId);
+        });
+
+        // ── Per-session CTS for background timers ─────────────────────────────
+        // Cancelled after host.RunAsync() returns so timers don't outlive their session.
+        using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var sessionCt = sessionCts.Token;
+
+        // Renewal timer: fires once after renewInterval to start a fresh session.
+        Log.Debug("[server] Session renewal scheduled every {Hours}h.", renewInterval.TotalHours);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(renewInterval, sessionCt);
+                if (!sessionCt.IsCancellationRequested)
+                {
+                    Log.Information("[server] Renew interval elapsed ({Hours}h) — renewing session.",
+                        renewInterval.TotalHours);
+                    Environment.ExitCode = EdsExitCodes.IntentionalRestart;
+                    lifetime.StopApplication();
+                }
+            }
+            catch (OperationCanceledException) { /* session ended */ }
+        }, sessionCt);
+
+        // Credential expiry watcher: renews before the NATS cred expires.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!sessionCt.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(15), sessionCt);
+                    var expiry    = SessionService.GetCredentialExpiry(credsFile);
+                    var remaining = expiry - DateTimeOffset.UtcNow;
+                    if (remaining <= TimeSpan.FromHours(1))
+                    {
+                        Log.Warning("[server] NATS credential expires in {Minutes} min — renewing session.",
+                            (int)remaining.TotalMinutes < 0 ? 0 : (int)remaining.TotalMinutes);
+                        Environment.ExitCode = EdsExitCodes.IntentionalRestart;
+                        lifetime.StopApplication();
+                        return;
+                    }
+                    Log.Debug("[server] NATS credential valid for {Hours}h {Min}m.",
+                        (int)remaining.TotalHours, remaining.Minutes);
+                }
+            }
+            catch (OperationCanceledException) { /* session ended */ }
+        }, sessionCt);
+
+        await host.RunAsync(ct);
+        await sessionCts.CancelAsync();  // stop per-session timers
+
+        // ── Decide whether to renew or exit ───────────────────────────────────
+        if (ct.IsCancellationRequested || exitProcess)
+            break;
+
+        if (Environment.ExitCode == EdsExitCodes.IntentionalRestart)
+        {
+            Environment.ExitCode = EdsExitCodes.Success;
+            Log.Information("[server] Restarting with fresh session...");
+            continue;
+        }
+
+        // Any other exit code (success, fatal error) — stop the loop.
+        break;
+    }
 }
 
 /// <summary>
