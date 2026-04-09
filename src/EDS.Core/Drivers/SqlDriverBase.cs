@@ -470,13 +470,13 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// <summary>
     /// Appends one event to the pending batch and flushes when <see cref="ImportBatchSize"/> is reached.
     /// In upsert mode, builds SQL directly from the supplied schema to avoid a registry round-trip per row.
-    /// In time-series mode, inserts the raw event into the events table.
+    /// Import always upserts into the standard mirror table regardless of driver mode.
+    /// The bulk import is a point-in-time snapshot; time-series events tables are
+    /// populated by the live CDC stream once the server starts.
     /// </summary>
     public async Task ImportEventAsync(DbChangeEvent evt, Schema schema, CancellationToken ct = default)
     {
-        var sql = Mode == DriverMode.TimeSeries
-            ? BuildInsertEventSql(evt)
-            : BuildSql(evt, schema);
+        var sql = BuildSql(evt, schema);
         _pending.Append(sql);
         _count++;
         if (_count >= ImportBatchSize)
