@@ -603,14 +603,17 @@ static async Task<bool> RunImportPipelineAsync(
         jobId       = existingCheckpoint.JobId;
         downloadDir = existingCheckpoint.DownloadDir;
         cleanupDir  = false;   // keep files so we can resume again if needed
-        tableInfos  = await ImportService.TryLoadTableExportInfoAsync(tracker, ct);
-        Log.Information("[import] Resuming from: {Dir}", downloadDir);
 
+        // The directory may not exist if the process was killed before downloading
+        // started. Recreate it so the poll → download path can proceed normally.
         if (!Directory.Exists(downloadDir))
         {
-            Log.Fatal("[import] Resume failed — download directory no longer exists: {Dir}", downloadDir);
-            return false;
+            Log.Warning("[import] Download directory missing — recreating: {Dir}", downloadDir);
+            Directory.CreateDirectory(downloadDir);
         }
+
+        tableInfos = await ImportService.TryLoadTableExportInfoAsync(tracker, ct);
+        Log.Information("[import] Resuming import job {JobId} from: {Dir}", jobId, downloadDir);
     }
     else if (!string.IsNullOrEmpty(opts.Dir))
     {
@@ -640,13 +643,27 @@ static async Task<bool> RunImportPipelineAsync(
             Log.Information("[import] Export job created: {JobId}", jobId);
         }
 
-        Log.Information("[import] Waiting for export to complete...");
-        var exportLogger = loggerFactory.CreateLogger("import.export");
-        var job = await ImportService.PollUntilCompleteAsync(apiUrl, opts.ApiKey, jobId!, exportLogger, ct);
-
+        // Establish downloadDir and save checkpoint BEFORE polling so that a crash
+        // during the export phase can be resumed with `eds import --resume`.
         downloadDir = Path.Combine(opts.DataDir, $"import-{jobId}");
         Directory.CreateDirectory(downloadDir);
         cleanupDir = !opts.NoCleanup;
+
+        if (!opts.DryRun)
+        {
+            var earlyCheckpoint = new ImportCheckpoint
+            {
+                JobId          = jobId!,
+                DownloadDir    = downloadDir,
+                CompletedFiles = [],
+                StartedAt      = DateTimeOffset.UtcNow,
+            };
+            await ImportService.SaveCheckpointAsync(tracker, earlyCheckpoint, ct);
+        }
+
+        Log.Information("[import] Waiting for export to complete...");
+        var exportLogger = loggerFactory.CreateLogger("import.export");
+        var job = await ImportService.PollUntilCompleteAsync(apiUrl, opts.ApiKey, jobId!, exportLogger, ct);
 
         Log.Information("[import] Downloading export data...");
         tableInfos = await ImportService.BulkDownloadAsync(job, downloadDir, exportLogger, ct);
@@ -657,9 +674,9 @@ static async Task<bool> RunImportPipelineAsync(
         Directory.CreateDirectory(downloadDir);
     }
 
-    // ── Initialise / update checkpoint record ─────────────────────────────────
-    // Save a checkpoint record as soon as the download dir is known so that a
-    // crash during the import phase can be resumed with `eds import --resume`.
+    // ── Update checkpoint with completed download state ───────────────────────
+    // Written again here to record the final downloadDir and any completedFiles
+    // carried over from a previous --resume run.
     var checkpointKey = ImportService.CheckpointTrackerKey;
     if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
     {
