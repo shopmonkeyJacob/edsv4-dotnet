@@ -154,7 +154,7 @@ All events tables share the same columns regardless of the source table structur
 
 ### Auto-maintained views
 
-Two views are automatically created and refreshed whenever the schema changes:
+Three views are automatically created and refreshed whenever the schema changes:
 
 **`current_{table}`** — latest state of each entity (equivalent to the upsert mirror):
 
@@ -172,6 +172,15 @@ FROM eds_events.work_orders_history
 WHERE id = 'wo-abc123'
 ORDER BY _timestamp;
 ```
+
+**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible:
+
+```sql
+-- Complete current state, including both CDC-updated and import-only rows
+SELECT * FROM eds_events.work_orders_unified;
+```
+
+> The `{table}_unified` view is only created once the standard mirror table exists (i.e. after a bulk import has been run). If no import has been performed, only `current_{table}` and `{table}_history` are created. The view is automatically created on the next `eds server` start once the mirror table is present.
 
 ### Point-in-time queries
 
@@ -307,7 +316,8 @@ dotnet test --filter "Category!=Integration"
 | Project | What is tested |
 |---------|----------------|
 | `EDS.Core.Tests` | SQL helpers, schema column ordering, `DbChangeEvent` logic, `ValidationResult`, `RetryHelper`, `DriverRegistry`, and the `QuoteJsonElement` / `QuoteString` escaping helpers in `SqlDriverBase` |
-| `EDS.Infrastructure.Tests` | `StatusProvider` state management and URL sanitization |
+| `EDS.Infrastructure.Tests` | `SqliteTracker` CRUD and concurrent writes; `ApiSchemaRegistry` warm-start cache, version round-trip, and schema persistence; `StatusProvider` state management and URL sanitization |
+| `EDS.Cli.Tests` | `ImportService` checkpoint load/save, `JsonException` resilience (corrupt checkpoint is discarded and key deleted), resume-from-checkpoint, and completed-files tracking |
 | `EDS.Integration.Tests` (unit) | `BuildSql` output for PostgreSQL, MySQL, and SQL Server — INSERT, UPDATE (with and without diff), DELETE; special characters, SQL injection strings, Unicode, missing columns → NULL, and cross-driver balanced-quote invariant — all without a database connection |
 
 ### Integration tests (Docker required)
@@ -322,8 +332,9 @@ dotnet test tests/EDS.Integration.Tests --filter "Category=Integration"
 
 | Container | What is tested |
 |-----------|----------------|
-| `postgres:16-alpine` | Insert, upsert dedup, update, update-with-diff (partial column update), delete, single-quote strings, SQL injection stored literally, Unicode + emoji, null values, numerics, booleans, newlines in values, multi-row batch commit |
-| `mysql:8.0` | Same core scenarios, plus ISO 8601 → MySQL `TIMESTAMP` reformatting |
+| `postgres:16-alpine` | Insert, upsert dedup, update, update-with-diff (partial column update), delete, single-quote strings, SQL injection stored literally, Unicode + emoji, null values, numerics, booleans, newlines in values, multi-row batch commit; schema migration (add/change/drop columns, orphan table cleanup) |
+| `mysql:8.0` | Same core scenarios, plus ISO 8601 → MySQL `TIMESTAMP` reformatting; schema migration (add/change/drop columns, orphan table cleanup) |
+| `azure-sql-edge` (ARM64) / `mssql/server:2022` (x64) | Insert, upsert dedup, update, update-with-diff (partial column update), delete, Unicode, null values, numerics, timestamps, large text; schema migration |
 
 ## Configuration
 

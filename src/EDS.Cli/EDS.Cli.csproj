@@ -1,6 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>EDS.Cli.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\EDS.Core\EDS.Core.csproj" />
     <ProjectReference Include="..\EDS.Infrastructure\EDS.Infrastructure.csproj" />
     <ProjectReference Include="..\EDS.Importer\EDS.Importer.csproj" />

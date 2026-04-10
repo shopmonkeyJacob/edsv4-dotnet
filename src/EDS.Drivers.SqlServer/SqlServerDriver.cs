@@ -123,14 +123,20 @@ public sealed class SqlServerDriver : SqlDriverBase, IDriverHelp
             ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(evt.After.Value.GetRawText()) ?? []
             : [];
 
-        var cols      = schema.Columns();
-        var colList   = string.Join(", ", cols.Select(c => QuoteId(c)));
-        var valList   = string.Join(", ", cols.Select(c =>
+        var cols    = schema.Columns();
+        var colList = string.Join(", ", cols.Select(c => QuoteId(c)));
+        var valList = string.Join(", ", cols.Select(c =>
             obj.TryGetValue(c, out var v) ? QuoteJsonElement(v) : "NULL"));
-        var updateSet = string.Join(", ", cols.Where(c => c != "id")
-            .Select(c => $"target.{QuoteId(c)} = source.{QuoteId(c)}"));
-        var matchOn   = string.Join(" AND ",
+        var matchOn = string.Join(" AND ",
             schema.PrimaryKeys.Select(pk => $"target.{QuoteId(pk)} = source.{QuoteId(pk)}"));
+
+        // For UPDATEs, only touch columns listed in evt.Diff (partial update optimisation).
+        var updateCols = evt.Operation.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                         && evt.Diff?.Length > 0
+            ? evt.Diff.Where(c => c != "id" && cols.Contains(c)).ToList()
+            : cols.Where(c => c != "id").ToList();
+        var updateSet = string.Join(", ", updateCols
+            .Select(c => $"target.{QuoteId(c)} = source.{QuoteId(c)}"));
 
         return $"""
             MERGE {QuoteId(evt.Table)} AS target

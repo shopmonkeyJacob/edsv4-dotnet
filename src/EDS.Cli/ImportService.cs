@@ -256,7 +256,7 @@ internal static class ImportService
         {
             return JsonSerializer.Deserialize<ImportCheckpoint>(json);
         }
-        catch
+        catch (JsonException)
         {
             // Stale or incompatible value in the tracker (e.g. a bare JSON array written
             // by an older build). Treat as no checkpoint so the run starts fresh.

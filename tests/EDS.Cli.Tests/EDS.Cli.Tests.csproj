@@ -4,7 +4,6 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -14,9 +13,6 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
-    <PackageReference Include="Testcontainers.PostgreSql" />
-    <PackageReference Include="Testcontainers.MySql" />
-    <PackageReference Include="Testcontainers.MsSql" />
   </ItemGroup>
 
   <ItemGroup>
@@ -24,13 +20,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\EDS.Core\EDS.Core.csproj" />
+    <ProjectReference Include="..\..\src\EDS.Cli\EDS.Cli.csproj" />
     <ProjectReference Include="..\..\src\EDS.Infrastructure\EDS.Infrastructure.csproj" />
-    <ProjectReference Include="..\..\src\EDS.Importer\EDS.Importer.csproj" />
-    <ProjectReference Include="..\..\src\EDS.Drivers.PostgreSQL\EDS.Drivers.PostgreSQL.csproj" />
-    <ProjectReference Include="..\..\src\EDS.Drivers.MySQL\EDS.Drivers.MySQL.csproj" />
-    <ProjectReference Include="..\..\src\EDS.Drivers.SqlServer\EDS.Drivers.SqlServer.csproj" />
-    <ProjectReference Include="..\..\src\EDS.Drivers.Snowflake\EDS.Drivers.Snowflake.csproj" />
   </ItemGroup>
 
 </Project>

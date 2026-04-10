@@ -71,6 +71,11 @@ public sealed class ApiSchemaRegistry : ISchemaRegistry
     /// Bypasses the 24-hour TTL and immediately re-fetches the full schema catalog from the
     /// Shopmonkey API. Call this at the start of an import to guarantee the local cache
     /// reflects the latest HQ schema before any table DDL is executed.
+    /// <para>
+    /// This method is intended to be called once during startup, before any concurrent
+    /// schema lookups begin. It is not thread-safe to call concurrently with other registry
+    /// operations.
+    /// </para>
     /// </summary>
     public async Task ForceRefreshAsync(CancellationToken ct = default)
     {

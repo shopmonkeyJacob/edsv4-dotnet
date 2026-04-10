@@ -714,7 +714,7 @@ static async Task<bool> RunImportPipelineAsync(
     // ── Update checkpoint with completed download state ───────────────────────
     // Written again here to record the final downloadDir and any completedFiles
     // carried over from a previous --resume run.
-    var checkpointKey = ImportService.CompletedFilesTrackerKey;
+    var completedFilesKey = ImportService.CompletedFilesTrackerKey;
     if (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
     {
         var checkpoint = new ImportCheckpoint
@@ -779,7 +779,7 @@ static async Task<bool> RunImportPipelineAsync(
             Logger         = importLogger,
             Tracker        = (!opts.DryRun && !opts.SchemaOnly && !string.IsNullOrEmpty(jobId))
                                  ? tracker : null,
-            CheckpointKey  = checkpointKey,
+            CheckpointKey  = completedFilesKey,
             CompletedFiles = completedFiles,
         };
 

@@ -6,13 +6,15 @@ using Snowflake.Data.Client;
 using System.Text;
 using System.Text.Json;
 
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("EDS.Integration.Tests")]
+
 namespace EDS.Drivers.Snowflake;
 
 /// <summary>
 /// Streams CDC events into Snowflake using MERGE statements.
 /// Mirrors the Go snowflake driver with session ID correlation and batch limiting.
 /// </summary>
-public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, IDriverSessionHandler, IDriverMigration
+public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, IDriverSessionHandler, IDriverMigration, IDriverImport
 {
     private ISchemaRegistry? _registry;
     private ITracker?        _tracker;
@@ -216,6 +218,66 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
             await RefreshSchemaAsync(conn, ct);
     }
 
+    // ── IDriverImport ─────────────────────────────────────────────────────────
+
+    private const int ImportBatchSize = 200; // matches MaxBatchSize
+
+    public async Task InitForImportAsync(
+        ILogger logger,
+        ISchemaRegistry registry,
+        string url,
+        DriverMode mode = DriverMode.Upsert,
+        string eventsSchema = "eds_events",
+        CancellationToken ct = default)
+    {
+        _logger           = logger;
+        _registry         = registry;
+        _connectionString = BuildConnectionString(url);
+
+        using var conn = new SnowflakeDbConnection { ConnectionString = _connectionString };
+        await conn.OpenAsync(ct);
+        await RefreshSchemaAsync(conn, ct);
+    }
+
+    public async Task DropOrphanTablesAsync(ILogger logger, IReadOnlySet<string> knownTables, CancellationToken ct = default)
+    {
+        var orphans = _dbSchema.Keys.Where(t => !knownTables.Contains(t)).ToList();
+        if (orphans.Count == 0) return;
+
+        logger.LogInformation("[Snowflake] Dropping {Count} orphan table(s) not in current HQ schema: {Tables}",
+            orphans.Count, string.Join(", ", orphans));
+
+        using var conn = new SnowflakeDbConnection { ConnectionString = _connectionString };
+        await conn.OpenAsync(ct);
+        foreach (var table in orphans)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"DROP TABLE IF EXISTS {QuoteSnowId(table)};";
+            await cmd.ExecuteNonQueryAsync(ct);
+            logger.LogDebug("[Snowflake] Dropped orphan table {Table}.", table);
+        }
+        await RefreshSchemaAsync(conn, ct);
+    }
+
+    public Task CreateDatasourceAsync(Schema schema, CancellationToken ct = default) =>
+        MigrateNewTableAsync(_logger!, schema, ct);
+
+    public async Task ImportEventAsync(DbChangeEvent evt, Schema schema, CancellationToken ct = default)
+    {
+        _pending.Add((evt, schema));
+        if (_pending.Count >= ImportBatchSize)
+            await FlushAsync(_logger!, ct);
+    }
+
+    public async Task ImportCompletedAsync(string table, long rowCount, CancellationToken ct = default)
+    {
+        if (_pending.Count > 0)
+            await FlushAsync(_logger!, ct);
+        _logger!.LogInformation("[Snowflake] Imported {Rows} row(s) into {Table}.", rowCount, table);
+    }
+
+    // ── SQL generation ────────────────────────────────────────────────────────
+
     /// <summary>
     /// Builds a <c>CREATE OR REPLACE TABLE</c> statement for the given schema.
     /// Mirrors Go's <c>createSQL</c> function exactly.
@@ -282,6 +344,44 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
 
     // ─── SQL generation ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Builds the SQL statement for a single CDC event (DELETE or MERGE).
+    /// Extracted for testability — called by <see cref="MergeEventsAsync"/>.
+    /// </summary>
+    internal static string BuildEventSql(Schema schema, DbChangeEvent evt)
+    {
+        if (evt.Operation.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+        {
+            var where = string.Join(" AND ",
+                schema.PrimaryKeys.Select((pk, i) =>
+                    $"{QuoteSnowId(pk)} = {QuoteLiteral(evt.Key.Length > i + 1 ? evt.Key[i + 1] : string.Empty)}"));
+            return $"DELETE FROM {QuoteSnowId(schema.Table)} WHERE {where};";
+        }
+
+        var obj = evt.After.HasValue
+            ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(evt.After.Value.GetRawText()) ?? []
+            : [];
+
+        var cols = schema.Columns();
+        var colList = string.Join(", ", cols.Select(c => QuoteSnowId(c)));
+        var valList = string.Join(", ", cols.Select(c =>
+            obj.TryGetValue(c, out var v) ? QuoteJsonElement(v) : "NULL"));
+
+        var pks = string.Join(" AND ",
+            schema.PrimaryKeys.Select(pk => $"t.{QuoteSnowId(pk)} = s.{QuoteSnowId(pk)}"));
+
+        var updates = string.Join(", ", cols.Where(c => !schema.PrimaryKeys.Contains(c))
+            .Select(c => $"t.{QuoteSnowId(c)} = s.{QuoteSnowId(c)}"));
+
+        return $"""
+            MERGE INTO {QuoteSnowId(schema.Table)} t
+            USING (SELECT {valList}) s ({colList})
+            ON {pks}
+            WHEN MATCHED THEN UPDATE SET {updates}
+            WHEN NOT MATCHED THEN INSERT ({colList}) VALUES ({valList});
+            """;
+    }
+
     private static async Task MergeEventsAsync(
         SnowflakeDbConnection conn,
         Schema schema,
@@ -290,40 +390,7 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
     {
         foreach (var evt in events)
         {
-            string sql;
-            if (evt.Operation.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
-            {
-                var where = string.Join(" AND ",
-                    schema.PrimaryKeys.Select((pk, i) =>
-                        $"{QuoteSnowId(pk)} = {QuoteLiteral(evt.Key.Length > i + 1 ? evt.Key[i + 1] : string.Empty)}"));
-                sql = $"DELETE FROM {QuoteSnowId(schema.Table)} WHERE {where};";
-            }
-            else
-            {
-                var obj = evt.After.HasValue
-                    ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(evt.After.Value.GetRawText()) ?? []
-                    : [];
-
-                var cols = schema.Columns();
-                var colList = string.Join(", ", cols.Select(c => QuoteSnowId(c)));
-                var valList = string.Join(", ", cols.Select(c =>
-                    obj.TryGetValue(c, out var v) ? QuoteJsonElement(v) : "NULL"));
-
-                var pks = string.Join(" AND ",
-                    schema.PrimaryKeys.Select(pk => $"t.{QuoteSnowId(pk)} = s.{QuoteSnowId(pk)}"));
-
-                var updates = string.Join(", ", cols.Where(c => !schema.PrimaryKeys.Contains(c))
-                    .Select(c => $"t.{QuoteSnowId(c)} = s.{QuoteSnowId(c)}"));
-
-                sql = $"""
-                    MERGE INTO {QuoteSnowId(schema.Table)} t
-                    USING (SELECT {valList}) s ({colList})
-                    ON {pks}
-                    WHEN MATCHED THEN UPDATE SET {updates}
-                    WHEN NOT MATCHED THEN INSERT ({colList}) VALUES ({valList});
-                    """;
-            }
-
+            var sql = BuildEventSql(schema, evt);
             using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
             await cmd.ExecuteNonQueryAsync(ct);

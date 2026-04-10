@@ -267,7 +267,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     {
         if (Mode == DriverMode.TimeSeries)
         {
-            // Events table schema is fixed — just recreate views to include any new columns.
+            // Events table schema is fixed — recreate all three views to include any new columns.
             await using var conn = await OpenConnectionAsync(ct);
             await using var curViewCmd = conn.CreateCommand();
             curViewCmd.CommandText = BuildCurrentViewSql(schema.Table);
@@ -275,6 +275,16 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
             await using var histViewCmd = conn.CreateCommand();
             histViewCmd.CommandText = BuildHistoryViewSql(schema.Table, schema);
             await histViewCmd.ExecuteNonQueryAsync(ct);
+            if (DbSchema.ContainsKey(schema.Table))
+            {
+                var unifiedSql = BuildUnifiedViewSql(schema.Table, schema);
+                if (!string.IsNullOrEmpty(unifiedSql))
+                {
+                    await using var unifiedViewCmd = conn.CreateCommand();
+                    unifiedViewCmd.CommandText = unifiedSql;
+                    await unifiedViewCmd.ExecuteNonQueryAsync(ct);
+                }
+            }
             return;
         }
 
@@ -429,6 +439,21 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         await using var histViewCmd = conn.CreateCommand();
         histViewCmd.CommandText = BuildHistoryViewSql(schema.Table, schema);
         await histViewCmd.ExecuteNonQueryAsync(ct);
+
+        // The unified view joins against the standard mirror table — only create it
+        // if that table already exists. If the server has only ever run in time-series
+        // mode the mirror table may not be present; the view will be created the next
+        // time StartAsync runs after a bulk import has populated the mirror table.
+        if (DbSchema.ContainsKey(schema.Table))
+        {
+            var unifiedSql = BuildUnifiedViewSql(schema.Table, schema);
+            if (!string.IsNullOrEmpty(unifiedSql))
+            {
+                await using var unifiedViewCmd = conn.CreateCommand();
+                unifiedViewCmd.CommandText = unifiedSql;
+                await unifiedViewCmd.ExecuteNonQueryAsync(ct);
+            }
+        }
     }
 
     // ── Time-series SQL builders ──────────────────────────────────────────────
@@ -483,6 +508,55 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
             "  _company_id, _location_id, _model_ver,\n" +
             string.Join(",\n", fieldProjections) + "\n" +
             $"FROM {qualifiedTable}";
+
+        return BuildCreateOrReplaceViewSql(qualifiedView, selectSql);
+    }
+
+    /// <summary>
+    /// Builds a unified view that merges the CDC event stream with the standard mirror table.
+    /// Records that have CDC events use the event-derived state (authoritative).
+    /// Records that exist only in the mirror table (e.g. pre-import backfill not yet touched
+    /// by CDC) are included from the mirror table directly, ensuring the full dataset is visible.
+    /// The view is named <c>{table}_unified</c> in the events schema.
+    /// </summary>
+    private string BuildUnifiedViewSql(string table, Schema schema)
+    {
+        var cols = schema.Columns().ToList();
+        if (cols.Count == 0)
+            return string.Empty;  // schema has no columns — skip view creation
+
+        var qualifiedEventsTable = QualifyEventsTable(table, EventsSchema);
+        var qualifiedMirrorTable = QuoteId(table);
+        var qualifiedView        = QualifyEventsView(table + "_unified", EventsSchema);
+
+        // _entity_id stores Key[^1] — the single entity identifier string (the last segment
+        // of the CRDB row key). For all Shopmonkey tables this is the "id" column.
+        // For composite-PK tables, "id" is still the effective entity identifier.
+        var entityIdCol = schema.PrimaryKeys.Count > 0 ? schema.PrimaryKeys[0] : "id";
+
+        // Events side: project each data column out of the JSON payload.
+        var eventProjections = string.Join(",\n", cols.Select(col =>
+            $"  COALESCE({JsonExtract("_after", col)}, {JsonExtract("_before", col)}) AS {QuoteId(col)}"));
+
+        // Mirror-table side: select columns directly (aliased to avoid ambiguity).
+        var mirrorProjections = string.Join(",\n", cols.Select(col =>
+            $"  s.{QuoteId(col)}"));
+
+        var selectSql =
+            $"SELECT\n{eventProjections}\n" +
+            $"FROM (\n" +
+            $"  SELECT *,\n" +
+            $"    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn\n" +
+            $"  FROM {qualifiedEventsTable}\n" +
+            $") ranked\n" +
+            $"WHERE rn = 1 AND _operation <> 'DELETE'\n" +
+            $"\nUNION ALL\n\n" +
+            $"SELECT\n{mirrorProjections}\n" +
+            $"FROM {qualifiedMirrorTable} s\n" +
+            $"WHERE NOT EXISTS (\n" +
+            $"  SELECT 1 FROM {qualifiedEventsTable} e\n" +
+            $"  WHERE e._entity_id = s.{QuoteId(entityIdCol)}\n" +
+            $")";
 
         return BuildCreateOrReplaceViewSql(qualifiedView, selectSql);
     }
