@@ -175,6 +175,9 @@ public sealed class EventHubDriver : IDriver, IDriverLifecycle, IDriverHelp, IDr
             : Guid.NewGuid().ToString();
         var companyId  = root.TryGetProperty("companyId",  out var compEl)  ? compEl.GetString()  : null;
         var locationId = root.TryGetProperty("locationId", out var locEl)   ? locEl.GetString()   : null;
+        // Mirrors Go: LocationId uses locationId but falls back to companyId when locationId is absent.
+        // This matches the partition-key routing behaviour in the Go source.
+        var effectiveLocationId = companyId ?? locationId;
         return new DbChangeEvent
         {
             Operation  = "INSERT",
@@ -182,7 +185,7 @@ public sealed class EventHubDriver : IDriver, IDriverLifecycle, IDriverHelp, IDr
             Table      = table,
             Key        = [id],
             CompanyId  = companyId,
-            LocationId = companyId ?? locationId,
+            LocationId = effectiveLocationId,
             After      = JsonSerializer.Deserialize<JsonElement>(json),
             Timestamp  = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             Imported   = true,

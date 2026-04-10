@@ -388,13 +388,26 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
         IReadOnlyList<DbChangeEvent> events,
         CancellationToken ct)
     {
+        if (events.Count == 0) return;
+
+        // Build all SQL for this table's events, then execute inside a single transaction
+        // so the entire batch commits or rolls back atomically — and to reduce round-trips
+        // compared to auto-committing each statement individually.
+        var sb = new StringBuilder();
         foreach (var evt in events)
-        {
-            var sql = BuildEventSql(schema, evt);
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
+            sb.AppendLine(BuildEventSql(schema, evt));
+
+        using var tx  = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sb.ToString();
+        cmd.Transaction = tx;
+        // Tell Snowflake we are submitting multiple statements in one request.
+        var p = cmd.CreateParameter();
+        p.ParameterName = "multi_statement_count";
+        p.Value         = events.Count;
+        cmd.Parameters.Add(p);
+        await cmd.ExecuteNonQueryAsync(ct);
+        tx.Commit();
     }
 
     /// <summary>Quotes a Snowflake identifier: wraps in double-quotes and escapes any embedded double-quotes as "".</summary>

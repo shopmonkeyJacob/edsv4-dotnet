@@ -4,18 +4,22 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 
 ## Supported Drivers
 
-| Scheme       | Destination              | Import |
-|--------------|--------------------------|:------:|
-| `postgres`   | PostgreSQL               | ✓      |
-| `mysql`      | MySQL / MariaDB          | ✓      |
-| `sqlserver`  | SQL Server               | ✓      |
-| `snowflake`  | Snowflake                | ✓      |
-| `s3`         | Amazon S3                | ✓ ²    |
-| `azureblob`  | Azure Blob Storage       | ✓ ²    |
-| `file`       | Local NDJSON files       | ✓ ²    |
-| `kafka`      | Apache Kafka             | ✓ ³    |
-| `eventhub`   | Azure Event Hubs         | ✓ ³    |
+| Scheme       | Destination              | Import | Time-series | Add col | Change type | Drop col |
+|--------------|--------------------------|:------:|:-----------:|:-------:|:-----------:|:--------:|
+| `postgres`   | PostgreSQL               | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `mysql`      | MySQL / MariaDB          | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `sqlserver`  | SQL Server               | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `snowflake`  | Snowflake                | ✓      | —           | ✓       | ✓           | ✓        |
+| `s3`         | Amazon S3                | ✓ ²    | —           | —       | —           | —        |
+| `azureblob`  | Azure Blob Storage       | ✓ ²    | —           | —       | —           | —        |
+| `file`       | Local NDJSON files       | ✓ ²    | —           | —       | —           | —        |
+| `kafka`      | Apache Kafka             | ✓ ³    | —           | —       | —           | —        |
+| `eventhub`   | Azure Event Hubs         | ✓ ³    | —           | —       | —           | —        |
 
+> **Time-series**: Append-only events table with auto-maintained views (`current_`, `_history`, `_unified`). See [Time-Series Mode](#time-series-mode).
+>
+> **Add/Change/Drop col**: Whether the driver supports automatic schema migration when the Shopmonkey data model changes.
+>
 > ² S3, Azure Blob Storage, and File drivers transfer raw `.ndjson.gz` export files directly
 > to the destination, preserving the filename and per-table directory structure. No row-level
 > parsing is performed — the export format is already the natural storage format for these drivers.
@@ -75,6 +79,7 @@ Alternatively, open **System Settings → Privacy & Security → Security** and 
 | `--data-dir`      | Directory for state, logs, and credentials                                    |
 | `--verbose`       | Enable debug-level console output                                             |
 | `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode)|
+| `--events-schema` | Database schema for the events tables in `timeseries` mode (default: `eds_events`). MySQL ignores this — it uses a `__events` suffix in the same database instead. |
 
 ### `eds import` options
 
@@ -95,6 +100,7 @@ Alternatively, open **System Settings → Privacy & Security → Security** and 
 | `--no-cleanup`    | Keep the temporary download directory after import                |
 | `--resume`        | Resume the last interrupted import — re-polls the export if still in progress, skips already-downloaded files, and continues from the first unfinished row file (implies `--no-delete --no-cleanup`) |
 | `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode) |
+| `--events-schema` | Database schema for the events tables (default: `eds_events`). Ignored for MySQL. |
 
 #### Import resumability
 
@@ -332,9 +338,9 @@ dotnet test tests/EDS.Integration.Tests --filter "Category=Integration"
 
 | Container | What is tested |
 |-----------|----------------|
-| `postgres:16-alpine` | Insert, upsert dedup, update, update-with-diff (partial column update), delete, single-quote strings, SQL injection stored literally, Unicode + emoji, null values, numerics, booleans, newlines in values, multi-row batch commit; schema migration (add/change/drop columns, orphan table cleanup) |
-| `mysql:8.0` | Same core scenarios, plus ISO 8601 → MySQL `TIMESTAMP` reformatting; schema migration (add/change/drop columns, orphan table cleanup) |
-| `azure-sql-edge` (ARM64) / `mssql/server:2022` (x64) | Insert, upsert dedup, update, update-with-diff (partial column update), delete, Unicode, null values, numerics, timestamps, large text; schema migration |
+| `postgres:16-alpine` | Insert, upsert dedup, update, update-with-diff (partial column update), delete, single-quote strings, SQL injection stored literally, Unicode + emoji, null values, numerics, booleans, newlines in values, multi-row batch commit; schema migration (add/change/drop columns, orphan table cleanup); time-series mode (events table creation, current/history views, DELETE disappears from current view) |
+| `mysql:8.0` | Same core scenarios, plus ISO 8601 → MySQL `TIMESTAMP` reformatting; schema migration (add/change/drop columns, orphan table cleanup); time-series mode (events table and view creation, INSERT, DELETE) |
+| `azure-sql-edge` (ARM64) / `mssql/server:2022` (x64) | Insert, upsert dedup, update, update-with-diff (partial column update), delete, Unicode, null values, numerics, timestamps, large text; schema migration (add/change/drop columns, orphan table cleanup); time-series mode (events table and view creation, INSERT, current/history views, DELETE) |
 
 ## Configuration
 
