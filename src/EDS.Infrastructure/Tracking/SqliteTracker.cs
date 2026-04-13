@@ -11,7 +11,7 @@ public sealed class SqliteTracker : ITracker
 {
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _lock = new(1, 1);
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public SqliteTracker(string dbPath)
     {
@@ -43,6 +43,7 @@ public sealed class SqliteTracker : ITracker
 
     public async Task<string?> GetKeyAsync(string key, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         await _lock.WaitAsync(ct);
         try
         {
@@ -57,6 +58,7 @@ public sealed class SqliteTracker : ITracker
 
     public async Task SetKeyAsync(string key, string value, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         await _lock.WaitAsync(ct);
         try
         {
@@ -71,6 +73,7 @@ public sealed class SqliteTracker : ITracker
 
     public async Task SetKeysAsync(IReadOnlyDictionary<string, string> pairs, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         await _lock.WaitAsync(ct);
         try
         {
@@ -93,6 +96,7 @@ public sealed class SqliteTracker : ITracker
 
     public async Task DeleteKeyAsync(string key, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         await _lock.WaitAsync(ct);
         try
         {
@@ -106,6 +110,7 @@ public sealed class SqliteTracker : ITracker
 
     public async Task<int> DeleteKeysWithPrefixAsync(string prefix, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         await _lock.WaitAsync(ct);
         try
         {
@@ -123,6 +128,12 @@ public sealed class SqliteTracker : ITracker
         _disposed = true;
         await _lock.WaitAsync();
         try { _conn.Dispose(); }
-        finally { _lock.Release(); _lock.Dispose(); }
+        finally
+        {
+            _lock.Release();
+            // Do NOT dispose _lock: SemaphoreSlim holds no unmanaged resources, and
+            // disposing it while a racing caller is mid-WaitAsync throws ObjectDisposedException.
+            // The volatile _disposed flag is the correct guard; GC handles reclamation.
+        }
     }
 }

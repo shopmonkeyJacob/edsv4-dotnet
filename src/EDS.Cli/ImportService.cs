@@ -53,6 +53,22 @@ internal sealed class ExportJobResponse
 
 internal sealed record TableExportInfo(string Table, DateTimeOffset Timestamp);
 
+// ── ExportTimeoutError ────────────────────────────────────────────────────────
+
+/// <summary>
+/// Raised when an export job times out or one or more tables fail server-side.
+/// <see cref="PartialJob"/> holds the last known <see cref="ExportJobResponse"/>,
+/// allowing the caller to identify which tables completed (have URLs) and which
+/// still need retrying.
+/// </summary>
+internal sealed class ExportTimeoutError : TimeoutException
+{
+    public ExportJobResponse? PartialJob { get; }
+
+    public ExportTimeoutError(string message, ExportJobResponse? partialJob = null)
+        : base(message) => PartialJob = partialJob;
+}
+
 // ── ImportCheckpoint ──────────────────────────────────────────────────────────
 
 /// <summary>
@@ -85,6 +101,11 @@ internal static class ImportService
 
     // ── Export job ────────────────────────────────────────────────────────────
 
+    private const int _PollTimeoutSeconds = 4 * 60 * 60; // 4 hours — export jobs should never take this long
+
+    // Backoff delays (seconds) between successive import retries — doubles each time up to 8 min.
+    private static readonly int[] _ImportRetryDelays = [30, 60, 120, 240, 480];
+
     public static async Task<string> CreateExportJobAsync(
         string apiUrl, string apiKey,
         ExportJobCreateRequest request,
@@ -111,10 +132,17 @@ internal static class ImportService
         ILogger logger, CancellationToken ct = default)
     {
         var lastLogged = DateTimeOffset.MinValue;
+        var deadline   = DateTimeOffset.UtcNow.AddSeconds(_PollTimeoutSeconds);
+        ExportJobResponse? lastJob = null;
 
         while (true)
         {
             ct.ThrowIfCancellationRequested();
+
+            if (DateTimeOffset.UtcNow > deadline)
+                throw new ExportTimeoutError(
+                    $"Export job '{jobId}' did not complete within {_PollTimeoutSeconds / 3600} hours.",
+                    partialJob: lastJob);
 
             if (DateTimeOffset.UtcNow - lastLogged > TimeSpan.FromMinutes(1))
             {
@@ -135,9 +163,16 @@ internal static class ImportService
                 continue;
             }
 
-            foreach (var (table, d) in job.Tables)
-                if (d.Status == "Failed")
-                    throw new InvalidOperationException($"Export of table '{table}' failed: {d.Error}");
+            lastJob = job;
+
+            var failed = job.Tables
+                .Where(kv => kv.Value.Status == "Failed")
+                .Select(kv => kv.Key)
+                .ToList();
+            if (failed.Count > 0)
+                throw new ExportTimeoutError(
+                    $"Export of {failed.Count} table(s) failed server-side: [{string.Join(", ", failed)}]",
+                    partialJob: job);
 
             logger.LogDebug("[import] Export status: {Status}", job.ProgressString());
 
@@ -149,6 +184,113 @@ internal static class ImportService
 
             await Task.Delay(TimeSpan.FromSeconds(5), ct);
         }
+    }
+
+    /// <summary>
+    /// Polls <paramref name="initialJobId"/>, downloads results, and retries incomplete tables on failure.
+    /// <para>
+    /// When the server times out or individual tables fail, any tables that have already received
+    /// download URLs are fetched immediately.  A fresh targeted export job is then created for the
+    /// remaining tables and polled again, up to <paramref name="maxRetries"/> times with exponential
+    /// back-off (30 s → 60 s → 120 s → 240 s → 480 s).
+    /// </para>
+    /// <para>Returns the accumulated <see cref="TableExportInfo"/> list across all sub-jobs.</para>
+    /// </summary>
+    public static async Task<IReadOnlyList<TableExportInfo>> PollDownloadWithRetryAsync(
+        string apiUrl, string apiKey, string initialJobId,
+        string destDir,
+        IReadOnlyList<string>? companyIds,
+        IReadOnlyList<string>? locationIds,
+        ILogger logger,
+        int maxRetries = 5,
+        CancellationToken ct = default)
+    {
+        var allTableInfos = new List<TableExportInfo>();
+        var currentJobId  = initialJobId;
+        List<string>? pendingTables = null; // null = all tables from this job
+
+        for (int attempt = 0; attempt <= maxRetries; attempt++)
+        {
+            if (attempt > 0)
+            {
+                var delay = _ImportRetryDelays[Math.Min(attempt - 1, _ImportRetryDelays.Length - 1)];
+                logger.LogWarning(
+                    "[import] Retry {Attempt}/{MaxRetries} — {PendingCount} table(s) still pending, backing off {Delay}s: {Tables}",
+                    attempt, maxRetries, pendingTables?.Count ?? 0, delay, pendingTables);
+                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+
+                var subRequest = new ExportJobCreateRequest
+                {
+                    Tables      = pendingTables,
+                    CompanyIds  = companyIds,
+                    LocationIds = locationIds,
+                };
+                currentJobId = await CreateExportJobAsync(apiUrl, apiKey, subRequest, ct);
+                logger.LogInformation(
+                    "[import] Retry export job created: {JobId} (tables: {Tables})",
+                    currentJobId, pendingTables);
+            }
+
+            try
+            {
+                var job   = await PollUntilCompleteAsync(apiUrl, apiKey, currentJobId, logger, ct);
+                var infos = await BulkDownloadAsync(job, destDir, logger, ct);
+                allTableInfos.AddRange(infos);
+                logger.LogInformation(
+                    "[import] Sub-job complete — {Count} table(s) downloaded (attempt {AttemptNum}/{Total}).",
+                    infos.Count, attempt + 1, maxRetries + 1);
+                return allTableInfos;
+            }
+            catch (ExportTimeoutError exc)
+            {
+                var partial      = exc.PartialJob;
+                var completed    = new Dictionary<string, ExportJobTableData>(StringComparer.Ordinal);
+                var stillPending = new List<string>();
+
+                if (partial is not null)
+                {
+                    foreach (var (name, data) in partial.Tables)
+                    {
+                        if (data.Urls.Count > 0)
+                            completed[name] = data;
+                        else
+                            stillPending.Add(name);
+                    }
+                }
+                else if (pendingTables is not null)
+                {
+                    stillPending.AddRange(pendingTables);
+                }
+
+                // Download whatever completed before the timeout/failure.
+                if (completed.Count > 0)
+                {
+                    var partialResponse = new ExportJobResponse { Completed = false, Tables = completed };
+                    var partialInfos    = await BulkDownloadAsync(partialResponse, destDir, logger, ct);
+                    allTableInfos.AddRange(partialInfos);
+                    logger.LogInformation(
+                        "[import] Downloaded {Count} table(s) from partial job before timeout.", partialInfos.Count);
+                }
+
+                logger.LogWarning(
+                    "[import] {Count} table(s) did not complete on attempt {AttemptNum}/{Total}: {Tables}",
+                    stillPending.Count, attempt + 1, maxRetries + 1, stillPending);
+
+                if (stillPending.Count == 0)
+                    return allTableInfos; // everything with URLs was downloaded — treat as success
+
+                pendingTables = stillPending;
+
+                if (attempt == maxRetries)
+                    throw new ExportTimeoutError(
+                        $"Import failed after {maxRetries} retries. " +
+                        $"{pendingTables.Count} table(s) never completed: [{string.Join(", ", pendingTables)}]",
+                        partialJob: partial);
+            }
+        }
+
+        // Unreachable — satisfies the compiler.
+        return allTableInfos;
     }
 
     // ── Download ──────────────────────────────────────────────────────────────

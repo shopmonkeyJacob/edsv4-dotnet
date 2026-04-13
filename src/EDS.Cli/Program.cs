@@ -275,8 +275,11 @@ static async Task RunServerAsync(
                 svc.AddSingleton<EDS.Infrastructure.Metrics.StatusProvider>();
                 svc.AddHostedService<MetricsServer>();
                 svc.AddSingleton(registry);
-                svc.AddSingleton<EDS.Infrastructure.Tracking.SqliteTracker>(_ => tracker);
-                svc.AddSingleton<EDS.Core.Abstractions.ITracker>(_ => tracker);
+                // Pass the instance directly (not via factory) so the host's DI container
+                // does NOT take ownership and does NOT dispose the tracker when the host
+                // is torn down between session renewals.
+                svc.AddSingleton<EDS.Infrastructure.Tracking.SqliteTracker>(tracker);
+                svc.AddSingleton<EDS.Core.Abstractions.ITracker>(tracker);
 
                 svc.AddHostedService(sp => new EDS.Infrastructure.Notification.NotificationService(
                     natsUrl,
@@ -643,9 +646,11 @@ static async Task<bool> RunImportPipelineAsync(
         {
             var exportLogger = loggerFactory.CreateLogger("import.export");
             Log.Information("[import] No downloaded files found — re-polling export job {JobId}...", jobId);
-            var job = await ImportService.PollUntilCompleteAsync(apiUrl, opts.ApiKey, jobId!, exportLogger, ct);
-            Log.Information("[import] Downloading export data...");
-            tableInfos = await ImportService.BulkDownloadAsync(job, downloadDir, exportLogger, ct);
+            tableInfos = await ImportService.PollDownloadWithRetryAsync(
+                apiUrl, opts.ApiKey, jobId!, downloadDir,
+                companyIds:  opts.CompanyIds.Length  > 0 ? opts.CompanyIds  : null,
+                locationIds: opts.LocationIds.Length > 0 ? opts.LocationIds : null,
+                exportLogger, ct: ct);
         }
         else
         {
@@ -700,10 +705,11 @@ static async Task<bool> RunImportPipelineAsync(
 
         Log.Information("[import] Waiting for export to complete...");
         var exportLogger = loggerFactory.CreateLogger("import.export");
-        var job = await ImportService.PollUntilCompleteAsync(apiUrl, opts.ApiKey, jobId!, exportLogger, ct);
-
-        Log.Information("[import] Downloading export data...");
-        tableInfos = await ImportService.BulkDownloadAsync(job, downloadDir, exportLogger, ct);
+        tableInfos = await ImportService.PollDownloadWithRetryAsync(
+            apiUrl, opts.ApiKey, jobId!, downloadDir,
+            companyIds:  opts.CompanyIds.Length  > 0 ? opts.CompanyIds  : null,
+            locationIds: opts.LocationIds.Length > 0 ? opts.LocationIds : null,
+            exportLogger, ct: ct);
     }
     else
     {

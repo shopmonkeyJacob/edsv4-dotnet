@@ -28,9 +28,9 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
     private static readonly SchemaMap SchemaMap = DriverTestHelpers.ToSchemaMap(Schema);
 
     private const string EventsSchema = "eds_ts_pg_test";
-    private const string EventsTable  = $"{EventsSchema}.ts_pg_orders_events";
-    private const string CurrentView  = $"{EventsSchema}.current_ts_pg_orders";
-    private const string HistoryView  = $"{EventsSchema}.ts_pg_orders_history";
+    private const string EventsTable  = $"\"{EventsSchema}\".\"ts_pg_orders_events\"";
+    private const string CurrentView  = $"\"{EventsSchema}\".\"current_ts_pg_orders\"";
+    private const string HistoryView  = $"\"{EventsSchema}\".\"ts_pg_orders_history\"";
 
     public PostgreSqlTimeSeriesTests(PostgreSqlFixture fixture) =>
         _connectionString = fixture.ConnectionString;
@@ -115,7 +115,7 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
         await driver.FlushAsync(NullLogger.Instance);
 
         var count = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{EventsTable}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {EventsTable} WHERE _entity_id = '{entityId}'");
         Assert.Equal(1L, count);
     }
 
@@ -130,7 +130,7 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
         await driver.FlushAsync(NullLogger.Instance);
 
         var count = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{CurrentView}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {CurrentView} WHERE _entity_id = '{entityId}'");
         Assert.Equal(1L, count);
     }
 
@@ -148,11 +148,11 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
         await driver.FlushAsync(NullLogger.Instance);
 
         var count = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{CurrentView}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {CurrentView} WHERE _entity_id = '{entityId}'");
         Assert.Equal(1L, count);
 
         var histCount = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{EventsTable}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {EventsTable} WHERE _entity_id = '{entityId}'");
         Assert.Equal(2L, histCount);
     }
 
@@ -167,7 +167,7 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
         await driver.FlushAsync(NullLogger.Instance);
 
         var before = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{CurrentView}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {CurrentView} WHERE _entity_id = '{entityId}'");
         Assert.Equal(1L, before);
 
         await driver.ProcessAsync(NullLogger.Instance,
@@ -175,7 +175,7 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
         await driver.FlushAsync(NullLogger.Instance);
 
         var after = await QueryScalarAsync<long>(
-            $"SELECT COUNT(*) FROM \"{CurrentView}\" WHERE _entity_id = '{entityId}'");
+            $"SELECT COUNT(*) FROM {CurrentView} WHERE _entity_id = '{entityId}'");
         Assert.Equal(0L, after);
     }
 
@@ -191,7 +191,7 @@ public sealed class PostgreSqlTimeSeriesTests : IClassFixture<PostgreSqlFixture>
 
         // The history view should expose the "name" column extracted from _after JSON.
         var name = await QueryScalarAsync<string>(
-            $"SELECT name FROM \"{HistoryView}\" WHERE _entity_id = '{entityId}' LIMIT 1");
+            $"SELECT name FROM {HistoryView} WHERE _entity_id = '{entityId}' LIMIT 1");
         Assert.Equal("HistTest", name);
     }
 }
