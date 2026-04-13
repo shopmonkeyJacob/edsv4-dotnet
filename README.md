@@ -46,13 +46,13 @@ A .NET port of Shopmonkey's Enterprise Data Streaming server. Connects to Shopmo
 macOS Gatekeeper will block unsigned binaries downloaded from the internet. To allow EDS to run, execute the following command once after extracting the archive:
 
 ```sh
-xattr -d com.apple.quarantine ./EDS.Cli
+xattr -d com.apple.quarantine ./eds
 ```
 
 Then make it executable if needed:
 
 ```sh
-chmod +x ./EDS.Cli
+chmod +x ./eds
 ```
 
 Alternatively, open **System Settings → Privacy & Security → Security** and click **Open Anyway** after the first blocked launch attempt.

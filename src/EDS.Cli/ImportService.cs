@@ -104,7 +104,7 @@ internal static class ImportService
     private const int _PollTimeoutSeconds = 4 * 60 * 60; // 4 hours — export jobs should never take this long
 
     // Backoff delays (seconds) between successive import retries — doubles each time up to 8 min.
-    private static readonly int[] _ImportRetryDelays = [30, 60, 120, 240, 480];
+    internal static readonly int[] _ImportRetryDelays = [30, 60, 120, 240, 480];
 
     public static async Task<string> CreateExportJobAsync(
         string apiUrl, string apiKey,
@@ -129,10 +129,12 @@ internal static class ImportService
 
     public static async Task<ExportJobResponse> PollUntilCompleteAsync(
         string apiUrl, string apiKey, string jobId,
-        ILogger logger, CancellationToken ct = default)
+        ILogger logger, CancellationToken ct = default,
+        Func<string, string, string, CancellationToken, Task<ExportJobResponse>>? checkJobFn = null,
+        DateTimeOffset? deadlineOverride = null)
     {
         var lastLogged = DateTimeOffset.MinValue;
-        var deadline   = DateTimeOffset.UtcNow.AddSeconds(_PollTimeoutSeconds);
+        var deadline   = deadlineOverride ?? DateTimeOffset.UtcNow.AddSeconds(_PollTimeoutSeconds);
         ExportJobResponse? lastJob = null;
 
         while (true)
@@ -153,7 +155,7 @@ internal static class ImportService
             ExportJobResponse job;
             try
             {
-                job = await CheckJobAsync(apiUrl, apiKey, jobId, ct);
+                job = await (checkJobFn ?? CheckJobAsync)(apiUrl, apiKey, jobId, ct);
             }
             catch (Exception ex) when (RetryHelper.IsTransient(ex) && !ct.IsCancellationRequested)
             {
@@ -203,8 +205,17 @@ internal static class ImportService
         IReadOnlyList<string>? locationIds,
         ILogger logger,
         int maxRetries = 5,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<string, string, string, ILogger, CancellationToken, Task<ExportJobResponse>>? pollFn = null,
+        Func<ExportJobResponse, string, ILogger, CancellationToken, Task<IReadOnlyList<TableExportInfo>>>? downloadFn = null,
+        Func<string, string, ExportJobCreateRequest, CancellationToken, Task<string>>? createJobFn = null,
+        Func<TimeSpan, CancellationToken, Task>? delayFn = null)
     {
+        var doPoll     = pollFn      ?? ((url, key, jid, log, c) => PollUntilCompleteAsync(url, key, jid, log, ct: c));
+        var doDownload = downloadFn  ?? ((job, dir, log, c)       => BulkDownloadAsync(job, dir, log, c));
+        var doCreate   = createJobFn ?? ((url, key, req, c)       => CreateExportJobAsync(url, key, req, c));
+        var doDelay    = delayFn     ?? ((ts, c)                  => Task.Delay(ts, c));
+
         var allTableInfos = new List<TableExportInfo>();
         var currentJobId  = initialJobId;
         List<string>? pendingTables = null; // null = all tables from this job
@@ -217,7 +228,7 @@ internal static class ImportService
                 logger.LogWarning(
                     "[import] Retry {Attempt}/{MaxRetries} — {PendingCount} table(s) still pending, backing off {Delay}s: {Tables}",
                     attempt, maxRetries, pendingTables?.Count ?? 0, delay, pendingTables);
-                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+                await doDelay(TimeSpan.FromSeconds(delay), ct);
 
                 var subRequest = new ExportJobCreateRequest
                 {
@@ -225,7 +236,7 @@ internal static class ImportService
                     CompanyIds  = companyIds,
                     LocationIds = locationIds,
                 };
-                currentJobId = await CreateExportJobAsync(apiUrl, apiKey, subRequest, ct);
+                currentJobId = await doCreate(apiUrl, apiKey, subRequest, ct);
                 logger.LogInformation(
                     "[import] Retry export job created: {JobId} (tables: {Tables})",
                     currentJobId, pendingTables);
@@ -233,8 +244,8 @@ internal static class ImportService
 
             try
             {
-                var job   = await PollUntilCompleteAsync(apiUrl, apiKey, currentJobId, logger, ct);
-                var infos = await BulkDownloadAsync(job, destDir, logger, ct);
+                var job   = await doPoll(apiUrl, apiKey, currentJobId, logger, ct);
+                var infos = await doDownload(job, destDir, logger, ct);
                 allTableInfos.AddRange(infos);
                 logger.LogInformation(
                     "[import] Sub-job complete — {Count} table(s) downloaded (attempt {AttemptNum}/{Total}).",

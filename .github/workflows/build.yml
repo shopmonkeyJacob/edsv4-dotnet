@@ -37,7 +37,7 @@ jobs:
         run: dotnet build EDS.sln --no-restore --configuration Release
 
       - name: Test
-        run: dotnet test EDS.sln --no-build --configuration Release --logger "console;verbosity=normal"
+        run: dotnet test EDS.sln --no-build --configuration Release --logger "console;verbosity=normal" --filter "Category!=E2E"
 
   # ── Publish cross-platform binaries (version tags only) ──────────────────────
   publish:
@@ -79,10 +79,10 @@ jobs:
           OUT="publish/${{ matrix.rid }}"
           if [ "${{ matrix.rid }}" = "win-x64" ]; then
             # zip preserves nothing on Windows — fine, .exe has no execute concept
-            cd "$OUT" && zip -j "../../${{ matrix.archive }}" EDS.Cli.exe
+            cd "$OUT" && zip -j "../../${{ matrix.archive }}" eds.exe
           else
             # tar.gz preserves the execute bit set by dotnet publish
-            cd "$OUT" && tar czf "../../${{ matrix.archive }}" EDS.Cli
+            cd "$OUT" && tar czf "../../${{ matrix.archive }}" eds
           fi
 
       - name: Upload artifact

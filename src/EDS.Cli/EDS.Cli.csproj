@@ -33,6 +33,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Produce "eds" / "eds.exe" rather than the default "EDS.Cli" / "EDS.Cli.exe" -->
+    <AssemblyName>eds</AssemblyName>
     <!-- Bundle everything into a single executable per platform -->
     <PublishSingleFile>true</PublishSingleFile>
     <!-- Native libs (e.g. e_sqlite3.dylib) are extracted to a temp dir at first launch -->
