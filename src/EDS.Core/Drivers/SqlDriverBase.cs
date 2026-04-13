@@ -488,7 +488,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
                 ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn
               FROM {qualifiedTable}
             ) ranked
-            WHERE rn = 1 AND _operation <> 'DELETE'
+            WHERE rn = 1 AND _operation <> 'delete'
             """;
         return BuildCreateOrReplaceViewSql(qualifiedView, selectSql);
     }
@@ -549,7 +549,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
             $"    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn\n" +
             $"  FROM {qualifiedEventsTable}\n" +
             $") ranked\n" +
-            $"WHERE rn = 1 AND _operation <> 'DELETE'\n" +
+            $"WHERE rn = 1 AND _operation <> 'delete'\n" +
             $"\nUNION ALL\n\n" +
             $"SELECT\n{mirrorProjections}\n" +
             $"FROM {qualifiedMirrorTable} s\n" +
