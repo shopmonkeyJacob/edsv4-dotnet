@@ -130,7 +130,7 @@ public class SqlDriverBaseViewTests
     public void UnifiedView_ExcludesDeletedEvents()
     {
         var sql = BuildUnifiedViewSql("orders", SimpleSchema());
-        Assert.Contains("_operation <> 'DELETE'", sql);
+        Assert.Contains("_operation <> 'delete'", sql);
     }
 
     [Fact]
