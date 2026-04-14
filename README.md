@@ -169,50 +169,11 @@ Three views are automatically created and refreshed whenever the schema changes:
 SELECT * FROM eds_events.current_work_orders;
 ```
 
-**`{table}_history`** — full audit trail with each schema column extracted from the JSON payloads:
+**`{table}_history`** — full audit trail with each schema column extracted from the JSON payloads.
 
-```sql
--- Example: full change history for a specific work order
-SELECT _seq, _operation, _timestamp, id, status, total
-FROM eds_events.work_orders_history
-WHERE id = 'wo-abc123'
-ORDER BY _timestamp;
-```
-
-**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible:
-
-```sql
--- Complete current state, including both CDC-updated and import-only rows
-SELECT * FROM eds_events.work_orders_unified;
-```
+**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible.
 
 > The `{table}_unified` view is only created once the standard mirror table exists (i.e. after a bulk import has been run). If no import has been performed, only `current_{table}` and `{table}_history` are created. The view is automatically created on the next `eds server` start once the mirror table is present.
-
-### Point-in-time queries
-
-To reconstruct the state of all records at a specific moment, query the `current_{table}` view filtered by timestamp — or use a window function directly:
-
-```sql
--- State of all work orders as of a specific Unix millisecond timestamp
-SELECT * FROM (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn
-  FROM eds_events.work_orders_events
-  WHERE _timestamp <= 1743897600000   -- 2025-02-06T00:00:00Z
-) t
-WHERE rn = 1 AND _operation <> 'DELETE';
-```
-
-### Joining across tables in time-series mode
-
-When joining time-series tables, use the auto-maintained views to get current state on both sides:
-
-```sql
--- Current work orders joined to current customer
-SELECT wo.id, wo.status, c.name AS customer_name
-FROM eds_events.current_work_orders wo
-JOIN eds_events.current_customers c ON c.id = wo.customer_id;
-```
 
 ### Usage
 
@@ -322,7 +283,7 @@ dotnet test --filter "Category!=Integration"
 | Project | What is tested |
 |---------|----------------|
 | `EDS.Core.Tests` | SQL helpers, schema column ordering, `DbChangeEvent` logic, `ValidationResult`, `RetryHelper`, `DriverRegistry`, and the `QuoteJsonElement` / `QuoteString` escaping helpers in `SqlDriverBase` |
-| `EDS.Infrastructure.Tests` | `SqliteTracker` CRUD and concurrent writes; `ApiSchemaRegistry` warm-start cache, version round-trip, and schema persistence; `StatusProvider` state management and URL sanitization |
+| `EDS.Infrastructure.Tests` | `SqliteTracker` CRUD, concurrent writes, and dead-letter queue persistence (all field round-trips, NULL handling, error truncation, cross-reopen durability); `ApiSchemaRegistry` warm-start cache, version round-trip, and schema persistence; `StatusProvider` state management and URL sanitization |
 | `EDS.Cli.Tests` | `ImportService` checkpoint load/save, `JsonException` resilience (corrupt checkpoint is discarded and key deleted), resume-from-checkpoint, and completed-files tracking |
 | `EDS.Integration.Tests` (unit) | `BuildSql` output for PostgreSQL, MySQL, and SQL Server — INSERT, UPDATE (with and without diff), DELETE; special characters, SQL injection strings, Unicode, missing columns → NULL, and cross-driver balanced-quote invariant — all without a database connection |
 
@@ -349,7 +310,7 @@ At runtime EDS creates a `data/` directory (or the path set by `--data-dir`) con
 | File / Directory        | Description                                              |
 |-------------------------|----------------------------------------------------------|
 | `config.toml`           | Server settings — API token, driver URL, server ID       |
-| `state.db`              | SQLite database for change-tracking and import state     |
+| `state.db`              | SQLite database for change-tracking, import state, and the dead-letter queue |
 | `<session-id>.log`      | Per-session log file (always captured at Debug level)    |
 | `import-<timestamp>.log`| Log file for each import run                             |
 | `<session-id>/`         | NATS credentials for the current session                 |
@@ -367,6 +328,48 @@ url       = "postgres://user:password@localhost:5432/mydb"
 ```
 
 Environment variables prefixed with `EDS_` override any value in `config.toml` (e.g. `EDS_TOKEN`, `EDS_URL`).
+
+## Dead-Letter Queue
+
+When a batch of events cannot be flushed to the destination after all retry attempts, EDS writes each event to a **dead-letter queue** table in `data/state.db` rather than silently dropping it. This gives you a permanent record of what failed and the context needed to investigate.
+
+### When events are queued
+
+Events are moved to the DLQ when `FlushAsync` fails after **5 retry attempts** (with 2 s → 4 s → 8 s → 16 s → 30 s backoff). At that point:
+
+- A `Warning`-level log line is always written: `[dlq] N event(s) moved to dead-letter queue in state.db.`
+- Per-event `Debug`-level lines are written to the log file at all times, and to the console when `--verbose` is active.
+- The failed events are **ACKed** in NATS so they are permanently removed from the stream and will not block future processing.
+- The consumer continues running and processes the next incoming event normally.
+
+### Querying the DLQ
+
+The `dlq` table lives inside `data/state.db` alongside the existing key-value state. You can inspect it with any SQLite client:
+
+```sh
+sqlite3 data/state.db "SELECT failed_at, table_name, operation, error, retry_count FROM dlq ORDER BY id DESC LIMIT 20;"
+```
+
+### DLQ table schema
+
+| Column        | Type    | Description                                             |
+|---------------|---------|---------------------------------------------------------|
+| `id`          | INTEGER | Auto-increment primary key                              |
+| `failed_at`   | TEXT    | ISO 8601 timestamp when the entry was written           |
+| `event_id`    | TEXT    | Unique event ID from Shopmonkey                         |
+| `table_name`  | TEXT    | Source table (e.g. `work_orders`)                       |
+| `operation`   | TEXT    | `insert`, `update`, or `delete`                         |
+| `company_id`  | TEXT    | Shopmonkey company ID (nullable)                        |
+| `location_id` | TEXT    | Shopmonkey location ID (nullable)                       |
+| `retry_count` | INTEGER | Number of flush attempts before giving up               |
+| `error`       | TEXT    | Error message (truncated to 2 000 characters)           |
+| `payload`     | TEXT    | Raw JSON of the `after` payload (or `before` for deletes) |
+
+### What to do
+
+1. Check the `error` column to understand the root cause (network outage, schema mismatch, permission error, etc.), then fix the underlying problem.
+2. Once the issue is resolved, re-apply DLQ events manually if needed by extracting the `payload` column and replaying via the destination driver.
+3. Clear handled entries: `DELETE FROM dlq WHERE id <= <last-reviewed-id>;`
 
 ## Metrics & Status
 
@@ -442,6 +445,8 @@ NotificationService
 
 - **CDC events** arrive via NATS JetStream, are buffered in a channel, and flushed
   to the driver in batches with exponential-backoff retry on failure.
+- **Dead-letter queue** — events that cannot be flushed after all retries are persisted
+  to the `dlq` table in `state.db` so they can be inspected and replayed. See [Dead-Letter Queue](#dead-letter-queue).
 - **Notifications** from HQ allow the web interface to configure the driver, trigger
   a backfill import, pause/unpause streaming, request log uploads, and initiate
   in-place binary upgrades.
@@ -458,15 +463,7 @@ src/
   EDS.Core/             Interfaces, models, shared helpers
   EDS.Infrastructure/   NATS consumer, schema registry, metrics, upgrade
   EDS.Importer/         Bulk import pipeline (NDJSON/gz)
-  EDS.Drivers.PostgreSQL/
-  EDS.Drivers.MySQL/
-  EDS.Drivers.SqlServer/
-  EDS.Drivers.Snowflake/
-  EDS.Drivers.S3/
-  EDS.Drivers.AzureBlob/
-  EDS.Drivers.Kafka/
-  EDS.Drivers.EventHub/
-  EDS.Drivers.File/
+  EDS.Drivers.*/
 tests/
   EDS.Core.Tests/
   EDS.Infrastructure.Tests/

@@ -226,7 +226,7 @@ public class SqliteTrackerTests : IAsyncLifetime
     public async Task PushAsync_MultipleEvents_AllRowsWrittenAtomically()
     {
         var evts = Enumerable.Range(0, 3)
-            .Select(i => MakeEvent("invoices", "update", after: $"""{{ "id":"{i}" }}"""))
+            .Select(i => MakeEvent("invoices", "update", after: $$"""{"id":"{{i}}"}"""))
             .ToList();
 
         await _tracker.PushAsync(evts, "timeout", retryCount: 3);

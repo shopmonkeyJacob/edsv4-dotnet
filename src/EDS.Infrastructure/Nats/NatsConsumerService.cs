@@ -572,11 +572,10 @@ public sealed class NatsConsumerService : BackgroundService
             }
         }
 
-        // ── All attempts exhausted ─────────────────────────────────────────────
+        // ── All attempts exhausted — move to DLQ, ACK, and continue ─────────────
         _logger.LogError(lastEx,
-            "[consumer] Flush failed after {Max} attempt(s) — NAKing {Count} message(s) and stopping consumer.",
+            "[consumer] Flush failed after {Max} attempt(s) — {Count} message(s) will be moved to the dead-letter queue.",
             MaxFlushAttempts, pending.Count);
-        _logger.LogCritical("[consumer] Unrecoverable flush error. Process will exit with a failing status code.");
 
         // ── Write permanently-failed events to the dead-letter queue ──────────
         if (_config.Dlq is { } dlq)
@@ -589,8 +588,9 @@ public sealed class NatsConsumerService : BackgroundService
                     MaxFlushAttempts,
                     CancellationToken.None);
 
-                _logger.LogWarning("[dlq] {Count} event(s) moved to dead-letter queue in state.db.",
-                    pending.Count);
+                _logger.LogWarning(
+                    "[dlq] {Count} event(s) permanently failed after {Max} flush attempts — moved to dead-letter queue in state.db.",
+                    pending.Count, MaxFlushAttempts);
 
                 foreach (var (evt, _, _) in pending)
                     _logger.LogDebug(
@@ -605,15 +605,15 @@ public sealed class NatsConsumerService : BackgroundService
             }
         }
 
+        // ACK all events to permanently remove them from NATS (they are now in the DLQ).
         foreach (var (_, msg, _) in pending)
         {
-            try { await msg.NakAsync(cancellationToken: CancellationToken.None); } catch { }
+            try { await msg.AckAsync(cancellationToken: CancellationToken.None); } catch { }
         }
+        EdsMetrics.PendingEvents.Dec(pending.Count);
+        _status?.SetPendingFlush(0);
         pending.Clear();
-
-        // Signal a non-zero exit code so the process manager (systemd, Docker, etc.) will restart us.
-        Environment.ExitCode = EdsExitCodes.FatalError;
-        throw lastEx!;
+        // Return without throwing — the consumer continues processing new events.
     }
 
     // ── Schema migration (mirrors Go handlePossibleMigration) ─────────────────
