@@ -177,7 +177,7 @@ public sealed class NatsConsumerService : BackgroundService
         if (_driver is IDriverLifecycle lifecycle && _config.DriverConfig is not null)
         {
             _logger.LogInformation("[consumer] Starting driver lifecycle.");
-            lifecycleTask = lifecycle.StartAsync(_config.DriverConfig, stoppingToken);
+            lifecycleTask = StartDriverWithRetryAsync(lifecycle, _config.DriverConfig, stoppingToken);
         }
 
         await Task.WhenAll(consumerTask, lifecycleTask);
@@ -208,6 +208,32 @@ public sealed class NatsConsumerService : BackgroundService
             heartbeatCts.Cancel();
             try { await heartbeatTask; } catch (OperationCanceledException) { }
             _logger.LogInformation("[consumer] Consumer fork stopped. Session={SessionId}.", credInfo.SessionID);
+        }
+    }
+
+    // ── Driver startup with retry ─────────────────────────────────────────────
+
+    private static readonly int[] _DriverStartDelays = [5, 15, 30, 60, 120];
+
+    private async Task StartDriverWithRetryAsync(
+        IDriverLifecycle lifecycle, DriverConfig config, CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await lifecycle.StartAsync(config, ct);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException
+                                        && attempt < _DriverStartDelays.Length)
+            {
+                var delay = _DriverStartDelays[attempt];
+                _logger.LogWarning(ex,
+                    "[consumer] Driver startup failed (attempt {Attempt}/{Max}) — retrying in {Delay}s.",
+                    attempt + 1, _DriverStartDelays.Length + 1, delay);
+                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+            }
         }
     }
 

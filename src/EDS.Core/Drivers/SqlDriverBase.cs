@@ -538,9 +538,21 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         var eventProjections = string.Join(",\n", cols.Select(col =>
             $"  COALESCE({JsonExtract("_after", col)}, {JsonExtract("_before", col)}) AS {QuoteId(col)}"));
 
-        // Mirror-table side: select columns directly (aliased to avoid ambiguity).
+        // Mirror-table side: project columns that exist in the actual DB table.
+        // The API schema may contain columns added after the mirror table was last
+        // migrated; referencing those columns by name would cause the CREATE VIEW to
+        // fail on strict dialects (e.g. MySQL).  For any schema column that is not
+        // yet present in the mirror table we emit NULL so the UNION ALL column list
+        // remains consistent.  The view is automatically corrected the next time
+        // MigrateNewColumnsAsync runs and recreates it.
+        var mirrorDbCols = DbSchema.TryGetValue(table, out var dbColMap)
+            ? dbColMap.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         var mirrorProjections = string.Join(",\n", cols.Select(col =>
-            $"  s.{QuoteId(col)}"));
+            mirrorDbCols.Contains(col)
+                ? $"  s.{QuoteId(col)}"
+                : $"  NULL AS {QuoteId(col)}"));
 
         var selectSql =
             $"SELECT\n{eventProjections}\n" +
