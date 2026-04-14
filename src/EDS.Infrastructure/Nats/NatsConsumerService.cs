@@ -1,6 +1,7 @@
 using EDS.Core;
 using EDS.Core.Abstractions;
 using EDS.Core.Models;
+using EDS.Infrastructure.Alerting;
 using EDS.Infrastructure.Metrics;
 using MessagePack;
 using Microsoft.Extensions.Hosting;
@@ -82,6 +83,7 @@ public sealed class NatsConsumerService : BackgroundService
     private readonly IDriver _driver;
     private readonly ILogger<NatsConsumerService> _logger;
     private readonly EDS.Infrastructure.Metrics.StatusProvider? _status;
+    private readonly IAlertManager? _alertManager;
     private readonly DateTime _started = DateTime.UtcNow;
     private long _offset;
     private DateTimeOffset? _pauseStarted;
@@ -91,12 +93,14 @@ public sealed class NatsConsumerService : BackgroundService
         ConsumerConfig config,
         IDriver driver,
         ILogger<NatsConsumerService> logger,
-        EDS.Infrastructure.Metrics.StatusProvider? status = null)
+        EDS.Infrastructure.Metrics.StatusProvider? status = null,
+        IAlertManager? alertManager = null)
     {
-        _config = config;
-        _driver = driver;
-        _logger = logger;
-        _status = status;
+        _config       = config;
+        _driver       = driver;
+        _logger       = logger;
+        _status       = status;
+        _alertManager = alertManager;
     }
 
     /// <summary>
@@ -137,6 +141,11 @@ public sealed class NatsConsumerService : BackgroundService
         {
             _logger.LogWarning("[consumer] NATS connection disconnected.");
             _status?.SetNatsConnected(false);
+            if (_alertManager is not null)
+                _ = _alertManager.FireAsync(new Alert(
+                    "EDS NATS connection lost",
+                    $"The EDS consumer lost its NATS connection. It will attempt to reconnect automatically. Server={credInfo.ServerID}.",
+                    "warning"), CancellationToken.None);
             return ValueTask.CompletedTask;
         };
 
@@ -558,6 +567,11 @@ public sealed class NatsConsumerService : BackgroundService
                     _logger.LogWarning(ex,
                         "[consumer] Flush attempt {Attempt}/{Max} failed — retrying in {Delay}s: {Error}",
                         attempt, MaxFlushAttempts, (int)delay.TotalSeconds, ex.Message);
+                    if (_alertManager is not null)
+                        _ = _alertManager.FireAsync(new Alert(
+                            "EDS flush retry",
+                            $"Flush attempt {attempt}/{MaxFlushAttempts} failed: {ex.Message}. Retrying in {(int)delay.TotalSeconds}s.",
+                            "warning"), CancellationToken.None);
                     try { await Task.Delay(delay, ct); }
                     catch (OperationCanceledException) { break; }
 
@@ -581,6 +595,12 @@ public sealed class NatsConsumerService : BackgroundService
         _logger.LogError(lastEx,
             "[consumer] Flush failed after {Max} attempt(s) — {Count} message(s) will be moved to the dead-letter queue.",
             MaxFlushAttempts, pending.Count);
+
+        if (_alertManager is not null)
+            _ = _alertManager.FireAsync(new Alert(
+                "EDS events moved to dead-letter queue",
+                $"{pending.Count} event(s) permanently failed after {MaxFlushAttempts} flush attempts and were moved to the dead-letter queue: {lastEx?.Message}",
+                "critical"), CancellationToken.None);
 
         // ── Write permanently-failed events to the dead-letter queue ──────────
         if (_config.Dlq is { } dlq)

@@ -272,7 +272,9 @@ static async Task RunServerAsync(
             .ConfigureServices((ctx, svc) =>
             {
                 svc.Configure<MetricsOptions>(ctx.Configuration.GetSection("metrics"));
+                svc.Configure<EDS.Infrastructure.Configuration.AlertsOptions>(ctx.Configuration.GetSection("alerts"));
                 svc.AddSingleton<EDS.Infrastructure.Metrics.StatusProvider>();
+                svc.AddSingleton<EDS.Infrastructure.Alerting.IAlertManager, EDS.Infrastructure.Alerting.AlertManager>();
                 svc.AddHostedService<MetricsServer>();
                 svc.AddSingleton(registry);
                 // Pass the instance directly (not via factory) so the host's DI container
