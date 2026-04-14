@@ -51,4 +51,10 @@ public sealed class ConsumerConfig
 
     public ISchemaValidator? SchemaValidator { get; init; }
     public ISchemaRegistry? Registry { get; init; }
+
+    /// <summary>
+    /// Dead-letter queue for events that cannot be flushed after all retry attempts.
+    /// When set, permanently-failed events are persisted before the consumer stops.
+    /// </summary>
+    public IDlqWriter? Dlq { get; init; }
 }

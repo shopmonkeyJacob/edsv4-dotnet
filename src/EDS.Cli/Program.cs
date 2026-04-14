@@ -301,6 +301,7 @@ static async Task RunServerAsync(
                     svc.AddSingleton<EDS.Infrastructure.Nats.ConsumerConfig>(sp =>
                     {
                         var t             = sp.GetRequiredService<EDS.Core.Abstractions.ITracker>();
+                        var dlq           = sp.GetRequiredService<EDS.Infrastructure.Tracking.SqliteTracker>();
                         var schemaReg     = sp.GetRequiredService<EDS.Core.Abstractions.ISchemaRegistry>();
                         var driverLogger  = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
                             EDS.Infrastructure.Nats.NatsConsumerService>>();
@@ -315,6 +316,7 @@ static async Task RunServerAsync(
                             CredentialsFile       = credsFile,
                             Registry              = schemaReg,
                             ExportTableTimestamps = exportTs,
+                            Dlq                   = dlq,
                             DriverConfig          = new EDS.Core.Abstractions.DriverConfig
                             {
                                 Url            = driverUrl,

@@ -578,6 +578,33 @@ public sealed class NatsConsumerService : BackgroundService
             MaxFlushAttempts, pending.Count);
         _logger.LogCritical("[consumer] Unrecoverable flush error. Process will exit with a failing status code.");
 
+        // ── Write permanently-failed events to the dead-letter queue ──────────
+        if (_config.Dlq is { } dlq)
+        {
+            try
+            {
+                await dlq.PushAsync(
+                    pending.Select(p => p.evt),
+                    lastEx!.Message,
+                    MaxFlushAttempts,
+                    CancellationToken.None);
+
+                _logger.LogWarning("[dlq] {Count} event(s) moved to dead-letter queue in state.db.",
+                    pending.Count);
+
+                foreach (var (evt, _, _) in pending)
+                    _logger.LogDebug(
+                        "[dlq] event_id={EventId} table={Table} op={Op} company={Company} error={Error}",
+                        evt.Id, evt.Table, evt.Operation, evt.CompanyId, lastEx!.Message);
+            }
+            catch (Exception dlqEx)
+            {
+                _logger.LogError(dlqEx,
+                    "[dlq] Failed to write {Count} event(s) to dead-letter queue — entries will be lost.",
+                    pending.Count);
+            }
+        }
+
         foreach (var (_, msg, _) in pending)
         {
             try { await msg.NakAsync(cancellationToken: CancellationToken.None); } catch { }

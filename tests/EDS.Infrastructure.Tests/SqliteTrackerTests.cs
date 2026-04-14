@@ -1,5 +1,8 @@
 using EDS.Core.Abstractions;
+using EDS.Core.Models;
 using EDS.Infrastructure.Tracking;
+using Microsoft.Data.Sqlite;
+using System.Text.Json;
 
 namespace EDS.Infrastructure.Tests;
 
@@ -196,5 +199,159 @@ public class SqliteTrackerTests : IAsyncLifetime
             var result = await _tracker.GetKeyAsync($"concurrent:{i}");
             Assert.Equal($"value-{i}", result);
         }
+    }
+
+    // ── PushAsync (IDlqWriter) ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task PushAsync_SingleEvent_RowPersistedWithCorrectFields()
+    {
+        var evt = MakeEvent("orders", "insert", companyId: "c1", locationId: "l1",
+            after: """{"id":"evt-1","name":"Widget"}""");
+
+        await _tracker.PushAsync([evt], "connection refused", retryCount: 5);
+
+        var row = await ReadFirstDlqRowAsync();
+        Assert.Equal(evt.Id,         row.EventId);
+        Assert.Equal("orders",       row.TableName);
+        Assert.Equal("insert",       row.Operation);
+        Assert.Equal("c1",           row.CompanyId);
+        Assert.Equal("l1",           row.LocationId);
+        Assert.Equal(5L,             row.RetryCount);
+        Assert.Equal("connection refused", row.Error);
+        Assert.Contains("Widget",    row.Payload);   // raw After JSON
+    }
+
+    [Fact]
+    public async Task PushAsync_MultipleEvents_AllRowsWrittenAtomically()
+    {
+        var evts = Enumerable.Range(0, 3)
+            .Select(i => MakeEvent("invoices", "update", after: $"""{{ "id":"{i}" }}"""))
+            .ToList();
+
+        await _tracker.PushAsync(evts, "timeout", retryCount: 3);
+
+        Assert.Equal(3, await CountDlqRowsAsync());
+    }
+
+    [Fact]
+    public async Task PushAsync_NullOptionalFields_StoredAsNullInDatabase()
+    {
+        var evt = MakeEvent("services", "delete", companyId: null, locationId: null);
+
+        await _tracker.PushAsync([evt], "error", retryCount: 1);
+
+        var row = await ReadFirstDlqRowAsync();
+        Assert.Null(row.CompanyId);
+        Assert.Null(row.LocationId);
+    }
+
+    [Fact]
+    public async Task PushAsync_EventWithNoPayload_PayloadIsNull()
+    {
+        var evt = MakeEvent("parts", "delete");  // no after/before
+
+        await _tracker.PushAsync([evt], "timeout", retryCount: 0);
+
+        var row = await ReadFirstDlqRowAsync();
+        Assert.Null(row.Payload);
+    }
+
+    [Fact]
+    public async Task PushAsync_DeleteEvent_StoresBefore()
+    {
+        var evt = MakeEvent("parts", "delete",
+            before: """{"id":"b1","qty":5}""");
+
+        await _tracker.PushAsync([evt], "error", retryCount: 2);
+
+        var row = await ReadFirstDlqRowAsync();
+        Assert.Contains("qty", row.Payload);    // falls back to Before
+    }
+
+    [Fact]
+    public async Task PushAsync_LongError_TruncatedTo2000Chars()
+    {
+        var longError = new string('x', 3000);
+        var evt = MakeEvent("orders", "insert");
+
+        await _tracker.PushAsync([evt], longError, retryCount: 1);
+
+        var row = await ReadFirstDlqRowAsync();
+        Assert.Equal(2000, row.Error.Length);
+    }
+
+    [Fact]
+    public async Task PushAsync_EmptyList_WritesNoRows()
+    {
+        await _tracker.PushAsync([], "some error", retryCount: 1);
+
+        Assert.Equal(0, await CountDlqRowsAsync());
+    }
+
+    [Fact]
+    public async Task PushAsync_PersistsAcrossReopen()
+    {
+        var evt = MakeEvent("vehicles", "insert", after: """{"id":"v1"}""");
+        await _tracker.PushAsync([evt], "disk full", retryCount: 5);
+        await _tracker.DisposeAsync();
+
+        _tracker = new SqliteTracker(_dbPath);
+
+        Assert.Equal(1, await CountDlqRowsAsync());
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static DbChangeEvent MakeEvent(
+        string table,
+        string operation,
+        string? companyId  = null,
+        string? locationId = null,
+        string? after      = null,
+        string? before     = null) =>
+        new()
+        {
+            Id         = Guid.NewGuid().ToString(),
+            Table      = table,
+            Operation  = operation,
+            Key        = ["pk-1"],
+            CompanyId  = companyId,
+            LocationId = locationId,
+            After      = after  is not null ? JsonDocument.Parse(after).RootElement  : null,
+            Before     = before is not null ? JsonDocument.Parse(before).RootElement : null,
+        };
+
+    private async Task<int> CountDlqRowsAsync()
+    {
+        await using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        await conn.OpenAsync();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM dlq";
+        return (int)(long)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    private async Task<(string EventId, string TableName, string Operation,
+        string? CompanyId, string? LocationId, long RetryCount, string Error, string? Payload)>
+        ReadFirstDlqRowAsync()
+    {
+        await using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        await conn.OpenAsync();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT event_id, table_name, operation, company_id, location_id, " +
+            "retry_count, error, payload FROM dlq ORDER BY id LIMIT 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return (
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.IsDBNull(3) ? null : reader.GetString(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.GetInt64(5),
+            reader.GetString(6),
+            reader.IsDBNull(7) ? null : reader.GetString(7)
+        );
     }
 }

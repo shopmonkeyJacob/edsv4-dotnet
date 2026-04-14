@@ -1,13 +1,15 @@
 using EDS.Core.Abstractions;
+using EDS.Core.Models;
 using Microsoft.Data.Sqlite;
 
 namespace EDS.Infrastructure.Tracking;
 
 /// <summary>
 /// Persistent key-value store backed by SQLite in WAL mode.
-/// Replaces BuntDB from the Go implementation.
+/// Also implements <see cref="IDlqWriter"/> so the same database file holds
+/// both operational state and the dead-letter queue.
 /// </summary>
-public sealed class SqliteTracker : ITracker
+public sealed class SqliteTracker : ITracker, IDlqWriter
 {
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -36,6 +38,18 @@ public sealed class SqliteTracker : ITracker
             CREATE TABLE IF NOT EXISTS kv (
                 key   TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS dlq (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                failed_at   TEXT    NOT NULL,
+                event_id    TEXT    NOT NULL,
+                table_name  TEXT    NOT NULL,
+                operation   TEXT    NOT NULL,
+                company_id  TEXT,
+                location_id TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error       TEXT    NOT NULL,
+                payload     TEXT
             ) STRICT;
             """;
         cmd.ExecuteNonQuery();
@@ -118,6 +132,70 @@ public sealed class SqliteTracker : ITracker
             cmd.CommandText = "DELETE FROM kv WHERE key LIKE @prefix || '%'";
             cmd.Parameters.AddWithValue("@prefix", prefix);
             return await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally { _lock.Release(); }
+    }
+
+    // ── IDlqWriter ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Persists all events in <paramref name="events"/> to the <c>dlq</c> table in a
+    /// single transaction. Payload is the raw After (or Before for deletes) JSON text.
+    /// </summary>
+    public async Task PushAsync(
+        IEnumerable<DbChangeEvent> events,
+        string error,
+        int retryCount,
+        CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var failedAt   = DateTimeOffset.UtcNow.ToString("O");
+            var errorTrunc = error.Length > 2000 ? error[..2000] : error;
+
+            using var tx  = _conn.BeginTransaction();
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO dlq
+                    (failed_at, event_id, table_name, operation,
+                     company_id, location_id, retry_count, error, payload)
+                VALUES
+                    (@failed_at, @event_id, @table_name, @operation,
+                     @company_id, @location_id, @retry_count, @error, @payload)
+                """;
+
+            var pFailedAt   = cmd.Parameters.Add("@failed_at",   SqliteType.Text);
+            var pEventId    = cmd.Parameters.Add("@event_id",    SqliteType.Text);
+            var pTableName  = cmd.Parameters.Add("@table_name",  SqliteType.Text);
+            var pOperation  = cmd.Parameters.Add("@operation",   SqliteType.Text);
+            var pCompanyId  = cmd.Parameters.Add("@company_id",  SqliteType.Text);
+            var pLocationId = cmd.Parameters.Add("@location_id", SqliteType.Text);
+            var pRetryCount = cmd.Parameters.Add("@retry_count", SqliteType.Integer);
+            var pError      = cmd.Parameters.Add("@error",       SqliteType.Text);
+            var pPayload    = cmd.Parameters.Add("@payload",     SqliteType.Text);
+
+            pFailedAt.Value   = failedAt;
+            pError.Value      = errorTrunc;
+            pRetryCount.Value = retryCount;
+
+            foreach (var evt in events)
+            {
+                pEventId.Value    = evt.Id;
+                pTableName.Value  = evt.Table;
+                pOperation.Value  = evt.Operation;
+                pCompanyId.Value  = (object?)evt.CompanyId  ?? DBNull.Value;
+                pLocationId.Value = (object?)evt.LocationId ?? DBNull.Value;
+
+                string? payload = evt.After?.GetRawText() ?? evt.Before?.GetRawText();
+                pPayload.Value = (object?)payload ?? DBNull.Value;
+
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            tx.Commit();
         }
         finally { _lock.Release(); }
     }
