@@ -78,6 +78,11 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
         Description = "Database schema that holds the events tables in timeseries mode (default: eds_events).",
         Hidden      = true,
     };
+    var dryRunOption = new Option<bool>("--dry-run")
+    {
+        Description = "Receive and decode events but do not write them to the destination driver. " +
+                      "Useful for verifying NATS connectivity and schema compatibility.",
+    };
 
     var cmd = new Command("server") { Description = "Start the EDS streaming server." };
     cmd.Options.Add(cfgOpt);
@@ -86,6 +91,7 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     cmd.Options.Add(renewIntervalOption);
     cmd.Options.Add(driverModeOption);
     cmd.Options.Add(eventsSchemaOption);
+    cmd.Options.Add(dryRunOption);
     cmd.SetAction(async (parseResult, ct) =>
     {
         var cfg           = parseResult.GetValue(cfgOpt);
@@ -94,6 +100,7 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
         var renewInterval = parseResult.GetValue(renewIntervalOption) ?? TimeSpan.FromHours(24);
         var flagMode      = parseResult.GetValue(driverModeOption);
         var flagSchema    = parseResult.GetValue(eventsSchemaOption);
+        var dryRun        = parseResult.GetValue(dryRunOption);
 
         Directory.CreateDirectory(dataDir);
         var configPath = cfg?.FullName ?? Path.Combine(dataDir, "config.toml");
@@ -159,7 +166,7 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
             }
         }
 
-        await RunServerAsync(configPath, dataDir, verbose, renewInterval, tracker, driverMode, eventsSchema, ct);
+        await RunServerAsync(configPath, dataDir, verbose, renewInterval, tracker, driverMode, eventsSchema, dryRun, ct);
     });
     return cmd;
 }
@@ -178,6 +185,7 @@ static async Task RunServerAsync(
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
     DriverMode driverMode = DriverMode.Upsert,
     string eventsSchema = "eds_events",
+    bool dryRun = false,
     CancellationToken ct = default)
 {
     // ── One-time setup (shared across session renewals) ───────────────────────
@@ -201,6 +209,11 @@ static async Task RunServerAsync(
     Log.Information("[server] using API url: {ApiUrl}", apiUrl);
 
     var registry = BuildDriverRegistry();
+
+    if (dryRun)
+        Log.Warning("[dry-run] Running in dry-run mode — events will be received and decoded but not written to any destination.");
+    if (dryRun && !string.IsNullOrEmpty(driverUrl))
+        Log.Warning("[dry-run] Driver URL is configured ({Url}) but will be bypassed.", SessionService.MaskUrl(driverUrl));
 
     // Schema registry is fetched once and reused across session renewals.
     EDS.Infrastructure.Schema.ApiSchemaRegistry? schemaRegistry = null;
@@ -245,7 +258,7 @@ static async Task RunServerAsync(
         Log.Information("[server] Session log: {LogFile}", serverLogFile);
 
         var backgroundImportCts = new CancellationTokenSource();
-        var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts, driverMode, eventsSchema);
+        var handlers = BuildNotificationHandlers(sessionId, configPath, dataDir, verbose, driverUrl, apiKey, tracker, registry, backgroundImportCts, driverMode, eventsSchema, dryRun);
 
         // exitProcess: set by upgrade handler so the loop exits after session end,
         // allowing the replacement binary on disk to be executed by a process manager.
@@ -291,27 +304,38 @@ static async Task RunServerAsync(
                     sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
                         EDS.Infrastructure.Notification.NotificationService>>()));
 
-                if (!string.IsNullOrEmpty(driverUrl))
+                if (dryRun || !string.IsNullOrEmpty(driverUrl))
                 {
-                    svc.AddSingleton<EDS.Core.Abstractions.ISchemaRegistry>(_ => schemaRegistry!);
+                    // Schema registry — only needed for real drivers
+                    if (!string.IsNullOrEmpty(driverUrl) && schemaRegistry is not null)
+                        svc.AddSingleton<EDS.Core.Abstractions.ISchemaRegistry>(_ => schemaRegistry);
 
-                    var scheme = new Uri(driverUrl).Scheme;
-                    var driver = registry.Resolve(scheme)
-                        ?? throw new InvalidOperationException($"No driver registered for scheme '{scheme}'.");
-                    svc.AddSingleton<EDS.Core.Abstractions.IDriver>(_ => driver);
+                    // Driver — NullDriver in dry-run, real driver otherwise
+                    if (dryRun)
+                    {
+                        svc.AddSingleton<EDS.Core.Abstractions.IDriver>(_ => new NullDriver());
+                    }
+                    else
+                    {
+                        var scheme = new Uri(driverUrl).Scheme;
+                        var driver = registry.Resolve(scheme)
+                            ?? throw new InvalidOperationException($"No driver registered for scheme '{scheme}'.");
+                        svc.AddSingleton<EDS.Core.Abstractions.IDriver>(_ => driver);
+                    }
 
                     svc.AddSingleton<EDS.Infrastructure.Nats.ConsumerConfig>(sp =>
                     {
-                        var t             = sp.GetRequiredService<EDS.Core.Abstractions.ITracker>();
-                        var dlq           = sp.GetRequiredService<EDS.Infrastructure.Tracking.SqliteTracker>();
-                        var schemaReg     = sp.GetRequiredService<EDS.Core.Abstractions.ISchemaRegistry>();
-                        var driverLogger  = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
+                        var t            = sp.GetRequiredService<EDS.Core.Abstractions.ITracker>();
+                        var dlq          = sp.GetRequiredService<EDS.Infrastructure.Tracking.SqliteTracker>();
+                        var driverLogger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<
                             EDS.Infrastructure.Nats.NatsConsumerService>>();
-                        var exportInfos   = ImportService.TryLoadTableExportInfoAsync(t, CancellationToken.None)
-                                                .GetAwaiter().GetResult();
-                        var exportTs      = exportInfos is not null
+                        var exportInfos  = ImportService.TryLoadTableExportInfoAsync(t, CancellationToken.None)
+                                               .GetAwaiter().GetResult();
+                        var exportTs     = exportInfos is not null
                             ? exportInfos.ToDictionary(i => i.Table, i => i.Timestamp)
                             : new Dictionary<string, DateTimeOffset>();
+                        // GetService (nullable) — null when no URL or in dry-run
+                        var schemaReg = sp.GetService<EDS.Core.Abstractions.ISchemaRegistry>();
                         return new EDS.Infrastructure.Nats.ConsumerConfig
                         {
                             Url                   = natsUrl,
@@ -319,16 +343,17 @@ static async Task RunServerAsync(
                             Registry              = schemaReg,
                             ExportTableTimestamps = exportTs,
                             Dlq                   = dlq,
-                            DriverConfig          = new EDS.Core.Abstractions.DriverConfig
-                            {
-                                Url            = driverUrl,
-                                Logger         = driverLogger,
-                                SchemaRegistry = schemaReg,
-                                Tracker        = t,
-                                DataDir        = dataDir,
-                                Mode           = driverMode,
-                                EventsSchema   = eventsSchema,
-                            }
+                            DriverConfig          = dryRun || string.IsNullOrEmpty(driverUrl) ? null
+                                : new EDS.Core.Abstractions.DriverConfig
+                                {
+                                    Url            = driverUrl,
+                                    Logger         = driverLogger,
+                                    SchemaRegistry = schemaReg,
+                                    Tracker        = t,
+                                    DataDir        = dataDir,
+                                    Mode           = driverMode,
+                                    EventsSchema   = eventsSchema,
+                                }
                         };
                     });
 
@@ -953,7 +978,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         // ── Transition to server ──────────────────────────────────────────────
         Log.Information("[import] Import complete. Starting server...");
-        await RunServerAsync(configPath, dataDir, verbose, TimeSpan.FromHours(24), tracker, driverMode, eventsSchema, ct);
+        await RunServerAsync(configPath, dataDir, verbose, TimeSpan.FromHours(24), tracker, driverMode, eventsSchema, ct: ct);
     });
 
     return cmd;
@@ -1114,7 +1139,8 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
     DriverRegistry registry,
     CancellationTokenSource backgroundImportCts,
     DriverMode driverMode = DriverMode.Upsert,
-    string eventsSchema = "eds_events")
+    string eventsSchema = "eds_events",
+    bool dryRun = false)
 {
     // Prevents concurrent imports (Configure+backfill and Import notifications could
     // arrive close together). If an import is already running, subsequent requests skip.
@@ -1174,6 +1200,15 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
         // ── configure: validate URL, persist to config.toml; trigger import if backfill=true ──
         Configure = async (url, backfill) =>
         {
+            if (dryRun)
+                return new EDS.Infrastructure.Notification.ConfigureNotificationResponse
+                {
+                    Success   = false,
+                    SessionId = sessionId,
+                    Message   = "Cannot reconfigure driver in dry-run mode.",
+                    Backfill  = backfill,
+                };
+
             try
             {
                 var scheme = new Uri(url).Scheme;
