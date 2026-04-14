@@ -315,13 +315,12 @@ public sealed class SqlServerFixture : IAsyncLifetime
     // azure-sql-edge because sqlcmd lives at a different path than SQL Server 2022.
     private const string SaPassword = "yourStrong(!)Password";
 
-    private readonly IContainer _container = new ContainerBuilder()
-        .WithImage("mcr.microsoft.com/azure-sql-edge:latest")
+    private readonly IContainer _container = new ContainerBuilder("mcr.microsoft.com/azure-sql-edge:latest")
         .WithPortBinding(1433, true)
         .WithEnvironment("ACCEPT_EULA", "Y")
         .WithEnvironment("SA_PASSWORD", SaPassword)
         .WithEnvironment("MSSQL_SA_PASSWORD", SaPassword)
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(1433))
+        .WithWaitStrategy(Wait.ForUnixContainer().UntilMessageIsLogged("SQL Server is now ready for client connections"))
         .Build();
 
     public string ConnectionString { get; private set; } = string.Empty;

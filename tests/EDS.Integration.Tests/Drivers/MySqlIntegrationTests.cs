@@ -233,8 +233,7 @@ public sealed class MySqlFixture : IAsyncLifetime
     private const string User     = "root";
     private const string Password = "testpass";
 
-    private readonly MySqlContainer _container = new MySqlBuilder()
-        .WithImage("mysql:8.0")
+    private readonly MySqlContainer _container = new MySqlBuilder("mysql:8.0")
         .WithDatabase(DbName)
         .WithUsername(User)
         .WithPassword(Password)
