@@ -12,6 +12,8 @@ public sealed class StatusProvider
     private readonly DateTime _startedAt = DateTime.UtcNow;
     private long _eventsProcessed;
     private volatile bool _paused;
+    private volatile bool _natsConnected;
+    private volatile bool _consumerRunning;
     private volatile int _pendingFlush;
     private readonly object _lastEventLock = new();
     private DateTimeOffset? _lastEventAt;
@@ -31,6 +33,8 @@ public sealed class StatusProvider
 
     // ── Updates from NatsConsumerService ─────────────────────────────────────
 
+    public void SetNatsConnected(bool connected) => _natsConnected = connected;
+    public void SetConsumerRunning(bool running) => _consumerRunning = running;
     public void SetPaused(bool paused) => _paused = paused;
 
     public void SetPendingFlush(int count) => Interlocked.Exchange(ref _pendingFlush, count);
@@ -46,6 +50,35 @@ public sealed class StatusProvider
 
     public void RecordFlush(long count) =>
         Interlocked.Add(ref _eventsProcessed, count);
+
+    // ── Health probes ─────────────────────────────────────────────────────────
+
+    public (int StatusCode, HealthSnapshot Snapshot) GetLiveness()
+    {
+        bool running = _consumerRunning;
+        return (running ? 200 : 503, new HealthSnapshot
+        {
+            Status = running ? "ok" : "unavailable",
+            Checks = new() { ["consumer"] = running ? "ok" : "stopped" },
+        });
+    }
+
+    public (int StatusCode, HealthSnapshot Snapshot) GetReadiness()
+    {
+        bool connected = _natsConnected;
+        bool running   = _consumerRunning;
+        bool paused    = _paused;
+        bool ok        = connected && running;
+        return (ok ? 200 : 503, new HealthSnapshot
+        {
+            Status = ok ? "ok" : "unavailable",
+            Checks = new()
+            {
+                ["nats"]     = connected ? "ok" : "disconnected",
+                ["consumer"] = running ? (paused ? "paused" : "ok") : "stopped",
+            },
+        });
+    }
 
     // ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -84,6 +117,13 @@ public sealed class StatusProvider
         var b = new UriBuilder(uri) { UserName = string.Empty, Password = string.Empty };
         return b.Uri.ToString().TrimEnd('/');
     }
+}
+
+/// <summary>JSON-serialisable response returned by GET /healthz/live and GET /healthz/ready.</summary>
+public sealed class HealthSnapshot
+{
+    [JsonPropertyName("status")]  public string                      Status { get; init; } = "";
+    [JsonPropertyName("checks")]  public Dictionary<string, string>  Checks { get; init; } = new();
 }
 
 /// <summary>JSON-serialisable snapshot returned by GET /status.</summary>

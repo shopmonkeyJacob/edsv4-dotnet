@@ -61,7 +61,7 @@ public sealed class MetricsServer : BackgroundService
         }
 
         _logger.LogInformation(
-            "Metrics/status server listening on port {Port}. Endpoints: /metrics  /status",
+            "Metrics/status server listening on port {Port}. Endpoints: /metrics  /status  /healthz/live  /healthz/ready",
             _options.Port);
 
         stoppingToken.Register(() =>
@@ -110,6 +110,17 @@ public sealed class MetricsServer : BackgroundService
                 var snapshot = _status.GetSnapshot();
                 var json     = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);
                 ctx.Response.StatusCode  = 200;
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                ctx.Response.ContentLength64 = json.Length;
+                await ctx.Response.OutputStream.WriteAsync(json, ct);
+            }
+            else if (path is "/healthz/live" or "/healthz/ready")
+            {
+                var (code, snap) = path == "/healthz/live"
+                    ? _status.GetLiveness()
+                    : _status.GetReadiness();
+                var json = JsonSerializer.SerializeToUtf8Bytes(snap, JsonOpts);
+                ctx.Response.StatusCode  = code;
                 ctx.Response.ContentType = "application/json; charset=utf-8";
                 ctx.Response.ContentLength64 = json.Length;
                 await ctx.Response.OutputStream.WriteAsync(json, ct);

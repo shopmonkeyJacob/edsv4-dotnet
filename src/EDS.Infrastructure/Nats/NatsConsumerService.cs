@@ -136,11 +136,14 @@ public sealed class NatsConsumerService : BackgroundService
         nats.ConnectionDisconnected += (_, _) =>
         {
             _logger.LogWarning("[consumer] NATS connection disconnected.");
+            _status?.SetNatsConnected(false);
             return ValueTask.CompletedTask;
         };
 
         await nats.ConnectAsync();
         _logger.LogInformation("[consumer] Connected to NATS at {Url}", _config.Url);
+        _status?.SetNatsConnected(true);
+        _status?.SetConsumerRunning(true);
 
         // ── Step 2: Start heartbeat background task ───────────────────────────────
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -207,6 +210,8 @@ public sealed class NatsConsumerService : BackgroundService
         {
             heartbeatCts.Cancel();
             try { await heartbeatTask; } catch (OperationCanceledException) { }
+            _status?.SetConsumerRunning(false);
+            _status?.SetNatsConnected(false);
             _logger.LogInformation("[consumer] Consumer fork stopped. Session={SessionId}.", credInfo.SessionID);
         }
     }
