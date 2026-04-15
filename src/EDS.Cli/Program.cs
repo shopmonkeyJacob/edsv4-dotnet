@@ -70,8 +70,8 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     };
     var driverModeOption = new Option<string>("--driver-mode")
     {
-        Description = "How the SQL driver writes events: 'upsert' (default) mirrors source tables; " +
-                      "'timeseries' appends every event to an audit log with auto-maintained views.",
+        Description = "How the SQL driver writes events: 'timeseries' (default) appends every event to an audit log with auto-maintained views; " +
+                      "'upsert' mirrors source tables, keeping only the latest state.",
     };
     var eventsSchemaOption = new Option<string>("--events-schema")
     {
@@ -117,7 +117,10 @@ static Command BuildServerCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
 
         if (justEnrolled)
         {
-            AnsiConsole.WriteLine();
+            var wizardResult = await ConfigWizard.RunAsync(configPath, ct);
+            driverMode   = wizardResult.Mode;
+            eventsSchema = wizardResult.EventsSchema;
+
             var runImport = AnsiConsole.Confirm(
                 "Would you like to run an initial data import before starting the server?",
                 defaultValue: false);
@@ -183,7 +186,7 @@ static async Task RunServerAsync(
     bool verbose,
     TimeSpan renewInterval,
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
-    DriverMode driverMode = DriverMode.Upsert,
+    DriverMode driverMode = DriverMode.TimeSeries,
     string eventsSchema = "eds_events",
     bool dryRun = false,
     CancellationToken ct = default)
@@ -197,6 +200,16 @@ static async Task RunServerAsync(
     var apiKey    = config["token"] ?? string.Empty;
     var serverId  = config["server_id"] ?? string.Empty;
     var driverUrl = config["url"] ?? string.Empty;
+
+    var minPendingLatency = int.TryParse(config["min_pending_latency"], out var minSec)
+        ? TimeSpan.FromSeconds(minSec)
+        : TimeSpan.FromSeconds(2);
+    var maxPendingLatency = int.TryParse(config["max_pending_latency"], out var maxSec)
+        ? TimeSpan.FromSeconds(maxSec)
+        : TimeSpan.FromSeconds(30);
+    var maxAckPending = int.TryParse(config["max_ack_pending"], out var maxAck)
+        ? maxAck
+        : 16384;
 
     if (string.IsNullOrEmpty(apiKey))
     {
@@ -343,12 +356,15 @@ static async Task RunServerAsync(
                             Registry              = schemaReg,
                             ExportTableTimestamps = exportTs,
                             Dlq                   = dlq,
+                            MinPendingLatency     = minPendingLatency,
+                            MaxPendingLatency     = maxPendingLatency,
+                            MaxAckPending         = maxAckPending,
                             DriverConfig          = dryRun || string.IsNullOrEmpty(driverUrl) ? null
                                 : new EDS.Core.Abstractions.DriverConfig
                                 {
                                     Url            = driverUrl,
                                     Logger         = driverLogger,
-                                    SchemaRegistry = schemaReg,
+                                    SchemaRegistry = schemaReg!,
                                     Tracker        = t,
                                     DataDir        = dataDir,
                                     Mode           = driverMode,
@@ -878,7 +894,7 @@ static Command BuildImportCommand(Option<FileInfo?> cfgOpt, Option<bool> verbOpt
     var schemaOnlyOpt  = new Option<bool>("--schema-only")    { Description = "Create tables only; do not import any rows" };
     var singleOpt      = new Option<bool>("--single")         { Description = "Process one table at a time (no parallelism)" };
     var resumeOpt      = new Option<bool>("--resume")         { Description = "Resume the last interrupted import from the first unfinished file (implies --no-delete --no-cleanup)" };
-    var importModeOpt  = new Option<string>("--driver-mode")  { Description = "How the SQL driver writes events: 'upsert' (default) or 'timeseries' (append-only event log with auto-maintained views)." };
+    var importModeOpt  = new Option<string>("--driver-mode")  { Description = "How the SQL driver writes events: 'timeseries' (default) or 'upsert' (mirror source tables, keeping only the latest state)." };
     var importSchemaOpt = new Option<string>("--events-schema") { Description = "Database schema for events tables in timeseries mode (default: eds_events).", Hidden = true };
 
     var cmd = new Command("import") { Description = "Import a snapshot of Shopmonkey data." };
@@ -989,13 +1005,14 @@ static DriverMode ParseDriverMode(string? value) =>
     value?.ToLowerInvariant() switch
     {
         "timeseries" or "time-series" or "time_series" => DriverMode.TimeSeries,
-        _ => DriverMode.Upsert,
+        "upsert"                                       => DriverMode.Upsert,
+        _                                              => DriverMode.TimeSeries,  // default
     };
 
 /// <summary>
 /// Resolves the effective DriverMode by reconciling the CLI flag with what is persisted in config.toml:
 /// <list type="bullet">
-///   <item>No flag, no config → Upsert (default)</item>
+///   <item>No flag, no config → TimeSeries (default)</item>
 ///   <item>No flag, has config → use the stored value</item>
 ///   <item>Flag provided, no config → persist the flag value and use it</item>
 ///   <item>Flag provided, config differs → prompt user to confirm the change (unless noConfirm), then persist</item>
@@ -1138,7 +1155,7 @@ static EDS.Infrastructure.Notification.NotificationHandlers BuildNotificationHan
     EDS.Infrastructure.Tracking.SqliteTracker tracker,
     DriverRegistry registry,
     CancellationTokenSource backgroundImportCts,
-    DriverMode driverMode = DriverMode.Upsert,
+    DriverMode driverMode = DriverMode.TimeSeries,
     string eventsSchema = "eds_events",
     bool dryRun = false)
 {
