@@ -26,13 +26,19 @@ public sealed class DriverConfigurator
 /// </summary>
 public sealed class DriverRegistry
 {
-    private readonly Dictionary<string, IDriver> _drivers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Func<IDriver>> _factories = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DriverMetadata> _metadata = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _aliases = new(StringComparer.OrdinalIgnoreCase);
 
-    public void Register(string scheme, IDriver driver)
+    public void Register(string scheme, Func<IDriver> factory)
     {
-        _drivers[scheme] = driver;
-        if (driver is IDriverAlias aliased)
+        _factories[scheme] = factory;
+
+        // Instantiate a temporary instance for metadata introspection, then discard it.
+        var probe = factory();
+        _metadata[scheme] = BuildMetadata(scheme, probe);
+
+        if (probe is IDriverAlias aliased)
         {
             foreach (var alias in aliased.Aliases)
                 _aliases[alias] = scheme;
@@ -41,34 +47,38 @@ public sealed class DriverRegistry
 
     public IDriver? Resolve(string scheme)
     {
-        if (_drivers.TryGetValue(scheme, out var driver))
-            return driver;
-        if (_aliases.TryGetValue(scheme, out var canonical) && _drivers.TryGetValue(canonical, out driver))
-            return driver;
+        if (_factories.TryGetValue(scheme, out var factory))
+            return factory();
+        if (_aliases.TryGetValue(scheme, out var canonical) && _factories.TryGetValue(canonical, out factory))
+            return factory();
         return null;
     }
 
     public IReadOnlyList<DriverMetadata> GetAllMetadata()
     {
-        return _drivers.Select(kvp => BuildMetadata(kvp.Key, kvp.Value)).ToList();
+        return _metadata.Values.ToList();
     }
 
     public DriverMetadata? GetMetadataForUrl(string urlString)
     {
         if (!Uri.TryCreate(urlString, UriKind.Absolute, out var uri))
             return null;
-        var driver = Resolve(uri.Scheme);
-        return driver is null ? null : BuildMetadata(uri.Scheme, driver);
+        var scheme = ResolveScheme(uri.Scheme);
+        return scheme is not null && _metadata.TryGetValue(scheme, out var meta) ? meta : null;
     }
 
     public Dictionary<string, DriverConfigurator> GetConfigurations()
     {
-        return _drivers.ToDictionary(
+        return _factories.ToDictionary(
             kvp => kvp.Key,
-            kvp => new DriverConfigurator
+            kvp =>
             {
-                Metadata = BuildMetadata(kvp.Key, kvp.Value),
-                Fields = kvp.Value.Configuration()
+                var driver = kvp.Value();
+                return new DriverConfigurator
+                {
+                    Metadata = _metadata[kvp.Key],
+                    Fields = driver.Configuration()
+                };
             },
             StringComparer.OrdinalIgnoreCase);
     }
@@ -107,6 +117,15 @@ public sealed class DriverRegistry
         return driver.Validate(values);
     }
 
+    private string? ResolveScheme(string scheme)
+    {
+        if (_factories.ContainsKey(scheme))
+            return scheme;
+        if (_aliases.TryGetValue(scheme, out var canonical) && _factories.ContainsKey(canonical))
+            return canonical;
+        return null;
+    }
+
     private static DriverMetadata BuildMetadata(string scheme, IDriver driver)
     {
         var help = driver as IDriverHelp;
@@ -117,6 +136,7 @@ public sealed class DriverRegistry
             Description = help?.Description ?? string.Empty,
             ExampleUrl = help?.ExampleUrl ?? string.Empty,
             Help = help?.Help ?? string.Empty,
+            SupportsImport = driver is IDriverImport or IDriverDirectImport,
             SupportsMigration = driver is IDriverMigration
         };
     }

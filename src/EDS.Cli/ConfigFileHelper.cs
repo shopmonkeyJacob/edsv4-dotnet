@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace EDS.Cli;
 
 /// <summary>
@@ -21,11 +23,11 @@ internal static class ConfigFileHelper
 
         var lines   = existing.Split('\n').ToList();
         bool written = false;
+        var pattern = new Regex(@"^\s*" + Regex.Escape(key) + @"\s*=", RegexOptions.IgnoreCase);
 
         for (int i = 0; i < lines.Count; i++)
         {
-            var t = lines[i].TrimStart();
-            if (t.StartsWith(key, StringComparison.OrdinalIgnoreCase) && t.Contains('='))
+            if (pattern.IsMatch(lines[i]))
             {
                 lines[i] = $"{key} = \"{value}\"";
                 written  = true;

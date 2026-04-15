@@ -15,7 +15,7 @@ public class DriverRegistryTests
     {
         var registry = new DriverRegistry();
         var driver   = new StubDriver();
-        registry.Register("stub", driver);
+        registry.Register("stub", () => driver);
 
         Assert.Same(driver, registry.Resolve("stub"));
     }
@@ -31,7 +31,7 @@ public class DriverRegistryTests
     public void Resolve_CaseInsensitive()
     {
         var registry = new DriverRegistry();
-        registry.Register("MySQL", new StubDriver());
+        registry.Register("MySQL", () => new StubDriver());
 
         Assert.NotNull(registry.Resolve("mysql"));
         Assert.NotNull(registry.Resolve("MYSQL"));
@@ -44,7 +44,7 @@ public class DriverRegistryTests
     {
         var registry = new DriverRegistry();
         var driver   = new AliasedDriver();
-        registry.Register("postgresql", driver);
+        registry.Register("postgresql", () => driver);
 
         Assert.Same(driver, registry.Resolve("pg"));
         Assert.Same(driver, registry.Resolve("postgres"));
@@ -54,7 +54,7 @@ public class DriverRegistryTests
     public void Resolve_AliasIsCaseInsensitive()
     {
         var registry = new DriverRegistry();
-        registry.Register("postgresql", new AliasedDriver());
+        registry.Register("postgresql", () => new AliasedDriver());
 
         Assert.NotNull(registry.Resolve("PG"));
     }
@@ -65,8 +65,8 @@ public class DriverRegistryTests
     public void GetAllMetadata_ReturnsOnePerRegisteredDriver()
     {
         var registry = new DriverRegistry();
-        registry.Register("a", new StubDriver());
-        registry.Register("b", new StubDriver());
+        registry.Register("a", () => new StubDriver());
+        registry.Register("b", () => new StubDriver());
 
         Assert.Equal(2, registry.GetAllMetadata().Count);
     }
@@ -75,7 +75,7 @@ public class DriverRegistryTests
     public void GetAllMetadata_NamedDriver_UsesFriendlyName()
     {
         var registry = new DriverRegistry();
-        registry.Register("named", new NamedDriver());
+        registry.Register("named", () => new NamedDriver());
 
         var meta = registry.GetAllMetadata().Single();
 
@@ -88,7 +88,7 @@ public class DriverRegistryTests
     public void GetAllMetadata_StubDriver_FallsBackToScheme()
     {
         var registry = new DriverRegistry();
-        registry.Register("stub", new StubDriver());
+        registry.Register("stub", () => new StubDriver());
 
         Assert.Equal("stub", registry.GetAllMetadata().Single().Name);
     }
@@ -97,7 +97,7 @@ public class DriverRegistryTests
     public void GetAllMetadata_MigrationDriver_SupportsMigrationTrue()
     {
         var registry = new DriverRegistry();
-        registry.Register("mig", new MigrationDriver());
+        registry.Register("mig", () => new MigrationDriver());
 
         Assert.True(registry.GetAllMetadata().Single().SupportsMigration);
     }
@@ -106,7 +106,7 @@ public class DriverRegistryTests
     public void GetAllMetadata_PlainDriver_SupportsMigrationFalse()
     {
         var registry = new DriverRegistry();
-        registry.Register("stub", new StubDriver());
+        registry.Register("stub", () => new StubDriver());
 
         Assert.False(registry.GetAllMetadata().Single().SupportsMigration);
     }
@@ -117,7 +117,7 @@ public class DriverRegistryTests
     public void GetMetadataForUrl_ValidUrl_ReturnsMetadata()
     {
         var registry = new DriverRegistry();
-        registry.Register("stub", new StubDriver());
+        registry.Register("stub", () => new StubDriver());
 
         var meta = registry.GetMetadataForUrl("stub://localhost/db");
 
@@ -145,8 +145,8 @@ public class DriverRegistryTests
     public void GetConfigurations_IncludesAllRegisteredDrivers()
     {
         var registry = new DriverRegistry();
-        registry.Register("a", new StubDriver());
-        registry.Register("b", new StubDriver());
+        registry.Register("a", () => new StubDriver());
+        registry.Register("b", () => new StubDriver());
 
         var configs = registry.GetConfigurations();
 
@@ -160,7 +160,7 @@ public class DriverRegistryTests
     public void Validate_ValidConfig_ReturnsUrl()
     {
         var registry = new DriverRegistry();
-        registry.Register("test", new FieldValidatingDriver());
+        registry.Register("test", () => new FieldValidatingDriver());
 
         var (url, errors) = registry.Validate("test", new() { ["host"] = "dbhost" });
 
@@ -172,7 +172,7 @@ public class DriverRegistryTests
     public void Validate_MissingRequiredField_ReturnsError()
     {
         var registry = new DriverRegistry();
-        registry.Register("test", new FieldValidatingDriver());
+        registry.Register("test", () => new FieldValidatingDriver());
 
         var (_, errors) = registry.Validate("test", []);
 
@@ -208,7 +208,7 @@ public class DriverRegistryTests
     {
         var registry = new DriverRegistry();
         var driver   = new LifecycleDriver();
-        registry.Register("lc", driver);
+        registry.Register("lc", () => driver);
 
         var returned = await registry.CreateDriverAsync(
             "lc://localhost/db",
@@ -225,7 +225,7 @@ public class DriverRegistryTests
     {
         var registry = new DriverRegistry();
         var driver   = new StubDriver();
-        registry.Register("stub", driver);
+        registry.Register("stub", () => driver);
 
         var returned = await registry.CreateDriverAsync(
             "stub://localhost/db",

@@ -91,6 +91,8 @@ internal static class ImportService
     private const string TableExportTrackerKey  = "import:table-export";
     internal const string CheckpointTrackerKey  = "import:checkpoint";
 
+    private static readonly HttpClient _sharedHttp = new() { Timeout = TimeSpan.FromSeconds(30) };
+
     /// <summary>
     /// Separate key used by <see cref="EDS.Importer.NdjsonGzImporter"/> to persist the
     /// set of already-completed filenames as a JSON array. Kept distinct from
@@ -111,12 +113,16 @@ internal static class ImportService
         ExportJobCreateRequest request,
         CancellationToken ct = default)
     {
-        using var http = MakeClient(apiKey);
         var body = new StringContent(
             JsonSerializer.Serialize(request), Encoding.UTF8, "application/json");
 
         var resp = await RetryHelper.ExecuteAsync(
-            innerCt => http.PostAsync($"{apiUrl}/v3/export/bulk", body, innerCt),
+            innerCt =>
+            {
+                var req = NewRequest(HttpMethod.Post, $"{apiUrl}/v3/export/bulk", apiKey);
+                req.Content = body;
+                return _sharedHttp.SendAsync(req, innerCt);
+            },
             operationName: "create export job", ct: ct);
         await ThrowIfErrorAsync(resp, "creating export job", ct);
 
@@ -359,9 +365,8 @@ internal static class ImportService
                     var dest = Path.GetFullPath(Path.Combine(destDir, Path.GetFileName(uri.LocalPath)));
                     if (!dest.StartsWith(Path.GetFullPath(destDir) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                         throw new InvalidOperationException($"Download destination escaped target directory: {uri}");
-                    using var http = new HttpClient();
                     using var r = await RetryHelper.ExecuteAsync(
-                        ct2 => http.GetAsync(uri, ct2),
+                        ct2 => _sharedHttp.GetAsync(uri, ct2),
                         logger, operationName: $"download {Path.GetFileName(uri.LocalPath)}", ct: innerCt);
                     r.EnsureSuccessStatusCode();
                     await using var f = File.Create(dest);
@@ -423,9 +428,12 @@ internal static class ImportService
     private static async Task<ExportJobResponse> CheckJobAsync(
         string apiUrl, string apiKey, string jobId, CancellationToken ct)
     {
-        using var http = MakeClient(apiKey);
         var resp = await RetryHelper.ExecuteAsync(
-            innerCt => http.GetAsync($"{apiUrl}/v3/export/bulk/{Uri.EscapeDataString(jobId)}", innerCt),
+            innerCt =>
+            {
+                var req = NewRequest(HttpMethod.Get, $"{apiUrl}/v3/export/bulk/{Uri.EscapeDataString(jobId)}", apiKey);
+                return _sharedHttp.SendAsync(req, innerCt);
+            },
             operationName: "check export status", ct: ct);
         await ThrowIfErrorAsync(resp, "checking export status", ct);
 
@@ -463,13 +471,13 @@ internal static class ImportService
             $"Error {context}: HTTP {(int)resp.StatusCode}{tag} — {body}");
     }
 
-    private static HttpClient MakeClient(string apiKey)
+    private static HttpRequestMessage NewRequest(HttpMethod method, string url, string apiKey)
     {
-        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-        http.DefaultRequestHeaders.Authorization =
+        var req = new HttpRequestMessage(method, url);
+        req.Headers.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-        http.DefaultRequestHeaders.UserAgent.ParseAdd(
+        req.Headers.UserAgent.ParseAdd(
             $"Shopmonkey EDS Server/{EdsVersion.Current}");
-        return http;
+        return req;
     }
 }

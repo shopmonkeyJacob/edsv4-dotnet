@@ -22,6 +22,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     protected DatabaseSchema DbSchema = new();
 
     private readonly StringBuilder _pending = new();
+    private readonly List<DbChangeEvent> _pendingEvents = new();
     private int _count;
     private string _dbName = string.Empty;
 
@@ -106,7 +107,11 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     /// <summary>SQL literal for boolean FALSE. Override for dialects that use TRUE/FALSE.</summary>
     protected virtual string SqlFalse => "0";
 
-    /// <summary>Wraps a string value as a SQL literal. Override for Unicode prefixes (N'...').</summary>
+    /// <summary>
+    /// Wraps a string value as a SQL literal. Override for Unicode prefixes (N'...').
+    /// The default implementation doubles single quotes. Subclasses whose dialect uses
+    /// backslash-based escaping (e.g. MySQL) must override to escape backslashes as well.
+    /// </summary>
     protected virtual string QuoteString(string value) =>
         "'" + value.Replace("'", "''") + "'";
 
@@ -195,19 +200,25 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     public async Task<bool> ProcessAsync(ILogger logger, DbChangeEvent evt, CancellationToken ct = default)
     {
         SqlHelpers.AssertSafeIdentifier(evt.Table);
-        string sql;
         if (Mode == DriverMode.TimeSeries)
         {
-            sql = BuildInsertEventSql(evt);
+            _pendingEvents.Add(evt);
         }
         else
         {
+            // Upsert/general path: dynamic SQL is built per-schema because the column set varies
+            // by table. Parameterisation is not feasible here since the SQL shape changes per event.
+            // Safety relies on:
+            //   (a) table/column names are validated through SqlHelpers.AssertSafeIdentifier,
+            //   (b) string values go through QuoteString/QuoteJsonElement (subclasses override for
+            //       dialect-specific escaping — e.g. MySqlDriver handles backslash escaping),
+            //   (c) event data originates from a trusted internal CDC pipeline, not user input.
+            // This is a conscious trade-off, not an injection-proof guarantee.
             var schema = await Registry!.GetSchemaAsync(evt.Table, evt.ModelVersion ?? string.Empty, ct)
                 ?? throw new InvalidOperationException($"Schema not found for {evt.Table} v{evt.ModelVersion}");
-            sql = BuildSql(evt, schema);
+            _pending.Append(BuildSql(evt, schema));
         }
         logger.LogDebug("[{Driver}] Queuing {Op} on {Table}", GetType().Name, evt.Operation, evt.Table);
-        _pending.Append(sql);
         _count++;
         return false;
     }
@@ -215,22 +226,32 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
     public async Task FlushAsync(ILogger logger, CancellationToken ct = default)
     {
         if (_count == 0) return;
-        var sql = _pending.ToString();
         logger.LogInformation("[{Driver}] Flushing {Count} statement(s)", GetType().Name, _count);
 
         await using var conn = await OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
         try
         {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            cmd.Transaction = tx;
-            await cmd.ExecuteNonQueryAsync(ct);
+            if (_pendingEvents.Count > 0)
+            {
+                await FlushTimeSeriesAsync(conn, tx, ct);
+            }
+
+            if (_pending.Length > 0)
+            {
+                var sql = _pending.ToString();
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = sql;
+                cmd.Transaction = tx;
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
             await tx.CommitAsync(ct);
             logger.LogInformation("[{Driver}] Committed {Count} statement(s)", GetType().Name, _count);
         }
         catch (Exception ex)
         {
+            var sql = _pending.ToString();
             logger.LogError(ex, "[{Driver}] Transaction failed, rolling back. SQL: {Sql}",
                 GetType().Name, sql.Length > 500 ? sql[..500] + "…" : sql);
             if (sql.Length > 500)
@@ -241,6 +262,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         finally
         {
             _pending.Clear();
+            _pendingEvents.Clear();
             _count = 0;
         }
     }
@@ -465,28 +487,46 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         }
     }
 
-    // ── Time-series SQL builders ──────────────────────────────────────────────
+    // ── Time-series parameterized flush ─────────────────────────────────────
 
-    private string BuildInsertEventSql(DbChangeEvent evt)
+    private async Task FlushTimeSeriesAsync(DbConnection conn, DbTransaction tx, CancellationToken ct)
     {
-        SqlHelpers.AssertSafeIdentifier(evt.Table);
-        var qualifiedTable = QualifyEventsTable(evt.Table, EventsSchema);
-        var entityId = evt.GetPrimaryKey();
-        var diff     = evt.Diff is { Length: > 0 }
-            ? QuoteString(JsonSerializer.Serialize(evt.Diff))
-            : "NULL";
-        var before   = evt.Before.HasValue ? QuoteString(JsonSerializer.Serialize(evt.Before.Value)) : "NULL";
-        var after    = evt.After.HasValue  ? QuoteString(JsonSerializer.Serialize(evt.After.Value))  : "NULL";
-        var mvccTs   = string.IsNullOrEmpty(evt.MvccTimestamp) ? "NULL" : QuoteString(evt.MvccTimestamp);
+        foreach (var evt in _pendingEvents)
+        {
+            SqlHelpers.AssertSafeIdentifier(evt.Table);
+            var qualifiedTable = QualifyEventsTable(evt.Table, EventsSchema);
+            await using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                $"INSERT INTO {qualifiedTable} " +
+                "(_event_id, _operation, _entity_id, _timestamp, _mvcc_ts, _company_id, _location_id, _model_ver, _diff, _before, _after) " +
+                "VALUES (@p_event_id, @p_operation, @p_entity_id, @p_timestamp, @p_mvcc_ts, @p_company_id, @p_location_id, @p_model_ver, @p_diff, @p_before, @p_after)";
 
-        return $"INSERT INTO {qualifiedTable} " +
-               $"(_event_id, _operation, _entity_id, _timestamp, _mvcc_ts, _company_id, _location_id, _model_ver, _diff, _before, _after) " +
-               $"VALUES ({QuoteString(evt.Id)}, {QuoteString(evt.Operation)}, {QuoteString(entityId)}, " +
-               $"{evt.Timestamp}, {mvccTs}, " +
-               $"{(evt.CompanyId  is null ? "NULL" : QuoteString(evt.CompanyId))}, " +
-               $"{(evt.LocationId is null ? "NULL" : QuoteString(evt.LocationId))}, " +
-               $"{QuoteString(evt.ModelVersion ?? string.Empty)}, {diff}, {before}, {after});\n";
+            AddParam(cmd, "@p_event_id",    evt.Id);
+            AddParam(cmd, "@p_operation",   evt.Operation);
+            AddParam(cmd, "@p_entity_id",   evt.GetPrimaryKey());
+            AddParam(cmd, "@p_timestamp",   evt.Timestamp);
+            AddParam(cmd, "@p_mvcc_ts",     string.IsNullOrEmpty(evt.MvccTimestamp) ? DBNull.Value : evt.MvccTimestamp);
+            AddParam(cmd, "@p_company_id",  (object?)evt.CompanyId ?? DBNull.Value);
+            AddParam(cmd, "@p_location_id", (object?)evt.LocationId ?? DBNull.Value);
+            AddParam(cmd, "@p_model_ver",   evt.ModelVersion ?? string.Empty);
+            AddParam(cmd, "@p_diff",        evt.Diff is { Length: > 0 } ? JsonSerializer.Serialize(evt.Diff) : DBNull.Value);
+            AddParam(cmd, "@p_before",      evt.Before.HasValue ? JsonSerializer.Serialize(evt.Before.Value) : DBNull.Value);
+            AddParam(cmd, "@p_after",       evt.After.HasValue ? JsonSerializer.Serialize(evt.After.Value) : DBNull.Value);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
     }
+
+    private static void AddParam(DbCommand cmd, string name, object value)
+    {
+        var p = cmd.CreateParameter();
+        p.ParameterName = name;
+        p.Value = value;
+        cmd.Parameters.Add(p);
+    }
+
+    // ── Time-series SQL builders ──────────────────────────────────────────────
 
     private string BuildCurrentViewSql(string table)
     {

@@ -20,6 +20,7 @@ public static class SessionService
 {
     private const string DefaultNatsUrl     = "nats://connect.nats.shopmonkey.pub";
     internal  const string LastCredsFileKey = "session:last_creds_file";
+    private static readonly HttpClient _sharedHttp = new() { Timeout = TimeSpan.FromMinutes(2) };
 
     /// <summary>
     /// Fast-path: if a valid (non-expired) NATS credential from a previous session exists
@@ -137,18 +138,14 @@ public static class SessionService
             catch { /* malformed URL — omit driver metadata */ }
         }
 
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-        http.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-        http.DefaultRequestHeaders.UserAgent.ParseAdd(
-            $"Shopmonkey EDS Server/{EdsVersion.Current}");
-
         var json     = JsonSerializer.Serialize(body);
         var response = await RetryHelper.ExecuteAsync(
-            innerCt => http.PostAsync(
-                $"{apiUrl.TrimEnd('/')}/v3/eds/internal",
-                new StringContent(json, Encoding.UTF8, "application/json"),
-                innerCt),
+            innerCt =>
+            {
+                var req = NewRequest(HttpMethod.Post, $"{apiUrl.TrimEnd('/')}/v3/eds/internal", apiKey);
+                req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+                return _sharedHttp.SendAsync(req, innerCt);
+            },
             operationName: "session start", ct: ct);
 
         if (response.StatusCode == HttpStatusCode.Conflict)
@@ -205,18 +202,11 @@ public static class SessionService
     {
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            http.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-            http.DefaultRequestHeaders.UserAgent.ParseAdd(
-                $"Shopmonkey EDS Server/{EdsVersion.Current}");
-
-            var body     = JsonSerializer.Serialize(new { errored });
-            var response = await http.PostAsync(
-                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}",
-                new StringContent(body, Encoding.UTF8, "application/json"),
-                ct);
-
+            var body = JsonSerializer.Serialize(new { errored });
+            var req = NewRequest(HttpMethod.Post,
+                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}", apiKey);
+            req.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            var response = await _sharedHttp.SendAsync(req, ct);
             response.EnsureSuccessStatusCode();
         }
         catch
@@ -345,17 +335,11 @@ public static class SessionService
                 return (true, null);
             }
 
-            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
-            http.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-            http.DefaultRequestHeaders.UserAgent.ParseAdd(
-                $"Shopmonkey EDS Server/{EdsVersion.Current}");
-
             // Step 1: request a pre-signed upload URL from HQ.
-            var urlResp = await http.PostAsync(
-                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/log",
-                new StringContent("{}", Encoding.UTF8, "application/json"),
-                ct);
+            var urlReq = NewRequest(HttpMethod.Post,
+                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/log", apiKey);
+            urlReq.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            var urlResp = await _sharedHttp.SendAsync(urlReq, ct);
             urlResp.EnsureSuccessStatusCode();
 
             var urlJson = await urlResp.Content.ReadAsStringAsync(ct);
@@ -380,7 +364,7 @@ public static class SessionService
                     new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-tgz");
 
                 using var putReq = new HttpRequestMessage(HttpMethod.Put, uploadUrl) { Content = putContent };
-                var putResp = await http.SendAsync(putReq, ct);
+                var putResp = await _sharedHttp.SendAsync(putReq, ct);
                 putResp.EnsureSuccessStatusCode();
             }
             finally
@@ -410,17 +394,11 @@ public static class SessionService
     {
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            http.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-            http.DefaultRequestHeaders.UserAgent.ParseAdd(
-                $"Shopmonkey EDS Server/{EdsVersion.Current}");
-
-            var body     = JsonSerializer.Serialize(new { version = EdsVersion.Current });
-            await http.PostAsync(
-                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/heartbeat",
-                new StringContent(body, Encoding.UTF8, "application/json"),
-                ct);
+            var body = JsonSerializer.Serialize(new { version = EdsVersion.Current });
+            var req = NewRequest(HttpMethod.Post,
+                $"{apiUrl.TrimEnd('/')}/v3/eds/internal/{Uri.EscapeDataString(sessionId)}/heartbeat", apiKey);
+            req.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            await _sharedHttp.SendAsync(req, ct);
             // Heartbeat is best-effort — ignore non-success responses silently.
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -515,6 +493,16 @@ public static class SessionService
             if (parts.Length > 1) return parts[1];
         }
         return Environment.OSVersion.Version.ToString();
+    }
+
+    private static HttpRequestMessage NewRequest(HttpMethod method, string url, string apiKey)
+    {
+        var req = new HttpRequestMessage(method, url);
+        req.Headers.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        req.Headers.UserAgent.ParseAdd(
+            $"Shopmonkey EDS Server/{EdsVersion.Current}");
+        return req;
     }
 
     internal static string MaskUrl(string url)

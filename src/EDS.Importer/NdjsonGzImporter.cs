@@ -116,13 +116,25 @@ public sealed class NdjsonGzImporter
         int  skipped    = 0;
         var  byTable    = files.GroupBy(f => f.Table).ToList();
 
-        foreach (var tableGroup in byTable)
+        // The handler (IImportHandler / SqlDriverBase) holds mutable state (_pending buffer)
+        // that is not thread-safe. Serialize handler access so concurrent table groups don't
+        // corrupt the shared buffer, while still allowing MaxParallel table groups to overlap
+        // their file I/O and decompression work.
+        var handlerLock = new SemaphoreSlim(1, 1);
+        var maxParallel = _config.MaxParallel > 0
+            ? _config.MaxParallel
+            : Environment.ProcessorCount;
+
+        await Parallel.ForEachAsync(
+            byTable,
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallel, CancellationToken = ct },
+            async (tableGroup, innerCt) =>
         {
             var tableName = tableGroup.Key;
             if (!schemaMap.TryGetValue(tableName, out var schema))
             {
                 _logger.LogWarning("[import] No schema for table '{Table}' — skipping.", tableName);
-                continue;
+                return;
             }
 
             long rowCount     = 0;
@@ -136,30 +148,49 @@ public sealed class NdjsonGzImporter
                 if (completedFiles.Contains(fileName))
                 {
                     _logger.LogDebug("[import] Skipping already-completed file: {File}", fileName);
-                    skipped++;
+                    Interlocked.Increment(ref skipped);
                     continue;
                 }
 
-                rowCount   += await ProcessFileAsync(file.Path, file.Timestamp, schema, handler, ct);
-                totalFiles++;
+                await handlerLock.WaitAsync(innerCt);
+                try
+                {
+                    rowCount += await ProcessFileAsync(file.Path, file.Timestamp, schema, handler, innerCt);
+                }
+                finally
+                {
+                    handlerLock.Release();
+                }
+                Interlocked.Increment(ref totalFiles);
 
                 // ── Checkpoint: persist this file as done ─────────────────────
                 if (_config.Tracker is not null && _config.CheckpointKey is not null)
                 {
-                    completedFiles.Add(fileName);
+                    lock (completedFiles)
+                    {
+                        completedFiles.Add(fileName);
+                    }
                     await _config.Tracker.SetKeyAsync(
                         _config.CheckpointKey,
                         System.Text.Json.JsonSerializer.Serialize(completedFiles),
-                        ct);
+                        innerCt);
                 }
             }
 
-            await handler.ImportCompletedAsync(tableName, rowCount, ct);
-            totalRows += rowCount;
+            await handlerLock.WaitAsync(innerCt);
+            try
+            {
+                await handler.ImportCompletedAsync(tableName, rowCount, innerCt);
+            }
+            finally
+            {
+                handlerLock.Release();
+            }
+            Interlocked.Add(ref totalRows, rowCount);
 
             _logger.LogInformation("[import] {Table}: {Rows} row(s) in {Elapsed}.",
                 tableName, rowCount, DateTimeOffset.UtcNow - tableStarted);
-        }
+        });
 
         if (skipped > 0)
             _logger.LogInformation("[import] Skipped {Skipped} already-completed file(s).", skipped);
