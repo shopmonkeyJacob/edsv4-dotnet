@@ -52,6 +52,7 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
     {
         var schema = await _registry!.GetSchemaAsync(evt.Table, evt.ModelVersion ?? string.Empty, ct)
             ?? throw new InvalidOperationException($"Schema not found for {evt.Table} v{evt.ModelVersion}");
+        logger.LogDebug("[SnowflakeDriver] Queuing {Op} on {Table}", evt.Operation, evt.Table);
         _pending.Add((evt, schema));
         return _pending.Count >= MaxBatchSize;
     }
@@ -59,6 +60,8 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
     public async Task FlushAsync(ILogger logger, CancellationToken ct = default)
     {
         if (_pending.Count == 0) return;
+
+        logger.LogInformation("[SnowflakeDriver] Flushing {Count} statement(s)", _pending.Count);
 
         using var conn = new SnowflakeDbConnection { ConnectionString = _connectionString };
         await conn.OpenAsync(ct);
@@ -69,10 +72,10 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
         {
             var schema = group.First().schema;
             var events = group.Select(g => g.evt).ToList();
-            await MergeEventsAsync(conn, schema, events, ct);
+            await MergeEventsAsync(conn, schema, events, logger, ct);
         }
 
-        logger.LogDebug("Flushed {Count} records to Snowflake.", _pending.Count);
+        logger.LogInformation("[SnowflakeDriver] Committed {Count} statement(s)", _pending.Count);
         _pending.Clear();
     }
 
@@ -386,6 +389,7 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
         SnowflakeDbConnection conn,
         Schema schema,
         IReadOnlyList<DbChangeEvent> events,
+        ILogger logger,
         CancellationToken ct)
     {
         if (events.Count == 0) return;
@@ -397,17 +401,30 @@ public sealed class SnowflakeDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
         foreach (var evt in events)
             sb.AppendLine(BuildEventSql(schema, evt));
 
+        var sql = sb.ToString();
         using var tx  = conn.BeginTransaction();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = sb.ToString();
+        cmd.CommandText = sql;
         cmd.Transaction = tx;
         // Tell Snowflake we are submitting multiple statements in one request.
         var p = cmd.CreateParameter();
         p.ParameterName = "multi_statement_count";
         p.Value         = events.Count;
         cmd.Parameters.Add(p);
-        await cmd.ExecuteNonQueryAsync(ct);
-        tx.Commit();
+        try
+        {
+            await cmd.ExecuteNonQueryAsync(ct);
+            tx.Commit();
+        }
+        catch (Exception ex)
+        {
+            tx.Rollback();
+            logger.LogError(ex, "[SnowflakeDriver] Transaction failed, rolling back. SQL: {Sql}",
+                sql.Length > 500 ? sql[..500] + "…" : sql);
+            if (sql.Length > 500)
+                logger.LogDebug("[SnowflakeDriver] Full SQL: {Sql}", sql);
+            throw;
+        }
     }
 
     /// <summary>Quotes a Snowflake identifier: wraps in double-quotes and escapes any embedded double-quotes as "".</summary>

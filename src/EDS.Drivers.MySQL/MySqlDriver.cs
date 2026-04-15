@@ -144,6 +144,13 @@ public sealed class MySqlDriver : SqlDriverBase, IDriverHelp
 
     protected override string QuoteId(string name) => $"`{name.Replace("`", "``")}`";
 
+    // MySQL interprets \n, \t, \\, etc. as escape sequences inside single-quoted string
+    // literals. JSON payloads routinely contain sequences like \n (backslash + n) — without
+    // escaping the backslash first, MySQL converts it to a literal 0x0A newline before the
+    // JSON validator runs, producing "Invalid encoding in string" errors on JSON columns.
+    protected override string QuoteString(string value) =>
+        "'" + value.Replace("\\", "\\\\").Replace("'", "''") + "'";
+
     // ── IDriverHelp: test + config ────────────────────────────────────────────
 
     public override async Task TestAsync(ILogger logger, string url, CancellationToken ct = default)

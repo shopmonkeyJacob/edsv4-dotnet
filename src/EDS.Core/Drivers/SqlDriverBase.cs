@@ -233,6 +233,8 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         {
             logger.LogError(ex, "[{Driver}] Transaction failed, rolling back. SQL: {Sql}",
                 GetType().Name, sql.Length > 500 ? sql[..500] + "…" : sql);
+            if (sql.Length > 500)
+                logger.LogDebug("[{Driver}] Full SQL: {Sql}", GetType().Name, sql);
             await tx.RollbackAsync(ct);
             throw;
         }
@@ -473,8 +475,8 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         var diff     = evt.Diff is { Length: > 0 }
             ? QuoteString(JsonSerializer.Serialize(evt.Diff))
             : "NULL";
-        var before   = evt.Before.HasValue ? QuoteString(evt.Before.Value.GetRawText()) : "NULL";
-        var after    = evt.After.HasValue  ? QuoteString(evt.After.Value.GetRawText())  : "NULL";
+        var before   = evt.Before.HasValue ? QuoteString(JsonSerializer.Serialize(evt.Before.Value)) : "NULL";
+        var after    = evt.After.HasValue  ? QuoteString(JsonSerializer.Serialize(evt.After.Value))  : "NULL";
         var mvccTs   = string.IsNullOrEmpty(evt.MvccTimestamp) ? "NULL" : QuoteString(evt.MvccTimestamp);
 
         return $"INSERT INTO {qualifiedTable} " +
