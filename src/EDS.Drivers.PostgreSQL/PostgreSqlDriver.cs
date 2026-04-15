@@ -29,6 +29,14 @@ public sealed class PostgreSqlDriver : SqlDriverBase, IDriverHelp, IDriverAlias
     protected override string SqlTrue  => "TRUE";
     protected override string SqlFalse => "FALSE";
 
+    // Npgsql won't implicitly coerce string -> jsonb; we must declare the type.
+    protected override void AddJsonParam(DbCommand cmd, string name, object value)
+    {
+        var p = new NpgsqlParameter(name, NpgsqlTypes.NpgsqlDbType.Jsonb);
+        p.Value = value;
+        cmd.Parameters.Add(p);
+    }
+
     // ── SqlDriverBase: time-series overrides ──────────────────────────────────
 
     // PostgreSQL uses the JSONB ->> operator for JSON text extraction.

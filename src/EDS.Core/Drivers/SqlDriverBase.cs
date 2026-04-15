@@ -510,9 +510,9 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
             AddParam(cmd, "@p_company_id",  (object?)evt.CompanyId ?? DBNull.Value);
             AddParam(cmd, "@p_location_id", (object?)evt.LocationId ?? DBNull.Value);
             AddParam(cmd, "@p_model_ver",   evt.ModelVersion ?? string.Empty);
-            AddParam(cmd, "@p_diff",        evt.Diff is { Length: > 0 } ? JsonSerializer.Serialize(evt.Diff) : DBNull.Value);
-            AddParam(cmd, "@p_before",      evt.Before.HasValue ? JsonSerializer.Serialize(evt.Before.Value) : DBNull.Value);
-            AddParam(cmd, "@p_after",       evt.After.HasValue ? JsonSerializer.Serialize(evt.After.Value) : DBNull.Value);
+            AddJsonParam(cmd, "@p_diff",    evt.Diff is { Length: > 0 } ? JsonSerializer.Serialize(evt.Diff) : DBNull.Value);
+            AddJsonParam(cmd, "@p_before",  evt.Before.HasValue ? JsonSerializer.Serialize(evt.Before.Value) : DBNull.Value);
+            AddJsonParam(cmd, "@p_after",   evt.After.HasValue ? JsonSerializer.Serialize(evt.After.Value) : DBNull.Value);
 
             await cmd.ExecuteNonQueryAsync(ct);
         }
@@ -525,6 +525,11 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         p.Value = value;
         cmd.Parameters.Add(p);
     }
+
+    // Overridden by dialects (e.g. PostgreSQL) that need an explicit JSON/JSONB type
+    // hint on parameters bound to jsonb columns.
+    protected virtual void AddJsonParam(DbCommand cmd, string name, object value)
+        => AddParam(cmd, name, value);
 
     // ── Time-series SQL builders ──────────────────────────────────────────────
 
