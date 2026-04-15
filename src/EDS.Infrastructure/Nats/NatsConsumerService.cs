@@ -137,6 +137,19 @@ public sealed class NatsConsumerService : BackgroundService
 
         await using var nats = new NatsConnection(opts);
         _nats = nats;
+        // ConnectionOpened fires on both the initial connect and every successful reconnect.
+        // Use a flag to skip the first firing so the reconnect case gets its own log line.
+        bool initialConnectFired = false;
+        nats.ConnectionOpened += (_, _) =>
+        {
+            if (initialConnectFired)
+            {
+                _logger.LogInformation("[consumer] NATS connection re-established.");
+                _status?.SetNatsConnected(true);
+            }
+            initialConnectFired = true;
+            return ValueTask.CompletedTask;
+        };
         nats.ConnectionDisconnected += (_, _) =>
         {
             _logger.LogWarning("[consumer] NATS connection disconnected.");
