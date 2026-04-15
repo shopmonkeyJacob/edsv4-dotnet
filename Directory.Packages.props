@@ -11,6 +11,7 @@
 
   <!-- Azure -->
   <ItemGroup>
+    <PackageVersion Include="Azure.Identity"                                      Version="1.13.0" />
     <PackageVersion Include="Azure.Messaging.EventHubs"                          Version="5.12.2" />
     <PackageVersion Include="Azure.Storage.Blobs"                                Version="12.27.0" />
   </ItemGroup>

@@ -1,3 +1,4 @@
+using Azure.Identity;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using EDS.Core.Abstractions;
@@ -12,9 +13,10 @@ namespace EDS.Drivers.AzureBlob;
 /// Stores CDC events as JSON blobs in an Azure Blob Storage container.
 /// Path pattern: {container}/{prefix}/{table}/{timestamp}-{id}.json
 ///
-/// Supports two auth modes (determined by URL query parameters):
+/// Supports three auth modes (determined by URL query parameters):
 ///   key=&lt;base64-account-key&gt;              — storage account key
 ///   connection-string=&lt;uri-encoded-string&gt; — full connection string (e.g. Azurite)
+///   (neither)                              — DefaultAzureCredential (managed identity, env, CLI)
 /// </summary>
 public sealed class AzureBlobDriver : IDriver, IDriverLifecycle, IDriverHelp, IDriverDirectImport
 {
@@ -29,8 +31,10 @@ public sealed class AzureBlobDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
     public string Description => "Streams EDS messages as JSON blobs to an Azure Blob Storage container.";
     public string ExampleUrl  => "azureblob://accountname/containername?key=<base64-account-key>";
     public string Help        => "Each event is written as {prefix}/{table}/{timestamp}-{id}.json. " +
-                                 "Use 'key' for account-key auth or 'connection-string' for a full " +
-                                 "connection string (useful for Azurite and other emulators).";
+                                 "Use 'key' for account-key auth, 'connection-string' for a full " +
+                                 "connection string (useful for Azurite and other emulators), or " +
+                                 "omit both to use DefaultAzureCredential (managed identity, " +
+                                 "AZURE_* environment variables, Azure CLI, etc.).";
 
     public int MaxBatchSize => -1;
 
@@ -211,8 +215,10 @@ public sealed class AzureBlobDriver : IDriver, IDriverLifecycle, IDriverHelp, ID
             }
             else
             {
-                throw new InvalidOperationException(
-                    "Provide either 'key' (account key) or 'connection-string' in the URL.");
+                // No explicit credentials — fall back to DefaultAzureCredential.
+                // This supports managed identity (Azure VMs, AKS, App Service),
+                // AZURE_* environment variables, Visual Studio / Azure CLI auth, etc.
+                service = new BlobServiceClient(serviceUri, new DefaultAzureCredential());
             }
         }
 

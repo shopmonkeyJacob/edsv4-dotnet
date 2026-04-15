@@ -14,12 +14,30 @@ public static class SqlHelpers
     private static readonly Regex SafeNumericLiteralPattern =
         new(@"^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$", RegexOptions.Compiled);
 
+    // Matches safe SQL identifiers: 1–128 characters, letters / digits / underscore only.
+    // Mirrors the Go reference validation applied before any SQL identifier is embedded.
+    private static readonly Regex SafeIdentifierPattern =
+        new(@"^[A-Za-z0-9_]{1,128}$", RegexOptions.Compiled);
+
     /// <summary>
     /// Returns true when <paramref name="rawText"/> is a safe SQL numeric literal
     /// (integer, decimal, or scientific notation) that can be embedded directly in SQL.
     /// </summary>
     public static bool IsValidNumericLiteral(string rawText) =>
         SafeNumericLiteralPattern.IsMatch(rawText);
+
+    /// <summary>
+    /// Throws <see cref="InvalidOperationException"/> if <paramref name="name"/> is not a
+    /// safe SQL identifier: 1–128 characters, ASCII letters/digits/underscores only.
+    /// Call this before embedding any externally sourced table or column name in SQL.
+    /// </summary>
+    public static void AssertSafeIdentifier(string name)
+    {
+        if (!SafeIdentifierPattern.IsMatch(name))
+            throw new InvalidOperationException(
+                $"Unsafe SQL identifier rejected: '{name}'. " +
+                "Identifiers must be 1–128 characters and contain only letters, digits, or underscores.");
+    }
 
 
     /// <summary>

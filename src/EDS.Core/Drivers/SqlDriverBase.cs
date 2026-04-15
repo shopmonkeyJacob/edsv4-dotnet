@@ -194,6 +194,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     public async Task<bool> ProcessAsync(ILogger logger, DbChangeEvent evt, CancellationToken ct = default)
     {
+        SqlHelpers.AssertSafeIdentifier(evt.Table);
         string sql;
         if (Mode == DriverMode.TimeSeries)
         {
@@ -289,8 +290,10 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         }
 
         await using var conn2 = await OpenConnectionAsync(ct);
+        SqlHelpers.AssertSafeIdentifier(schema.Table);
         foreach (var col in newColumns)
         {
+            SqlHelpers.AssertSafeIdentifier(col);
             if (DbSchema.TryGetValue(schema.Table, out var cols) && cols.ContainsKey(col)) continue;
             var prop = schema.Properties[col];
             var sql = BuildAlterAddColumnSql(schema.Table, col, PropToSqlType(prop, isPrimaryKey: false));
@@ -306,8 +309,10 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         if (Mode == DriverMode.TimeSeries) return;
 
         await using var conn = await OpenConnectionAsync(ct);
+        SqlHelpers.AssertSafeIdentifier(schema.Table);
         foreach (var col in changedColumns)
         {
+            SqlHelpers.AssertSafeIdentifier(col);
             if (!schema.Properties.TryGetValue(col, out var prop)) continue;
             var sql = BuildAlterColumnTypeSql(schema.Table, col, PropToSqlType(prop, isPrimaryKey: false));
             if (string.IsNullOrEmpty(sql)) continue;
@@ -325,8 +330,10 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
         if (Mode == DriverMode.TimeSeries) return;
 
         await using var conn = await OpenConnectionAsync(ct);
+        SqlHelpers.AssertSafeIdentifier(schema.Table);
         foreach (var col in removedColumns)
         {
+            SqlHelpers.AssertSafeIdentifier(col);
             if (DbSchema.TryGetValue(schema.Table, out var dbCols) && !dbCols.ContainsKey(col)) continue;
             var sql = BuildDropColumnSql(schema.Table, col);
             logger.LogInformation("[{Driver}] Dropping removed column {Column} from {Table}.", GetType().Name, col, schema.Table);
@@ -460,6 +467,7 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     private string BuildInsertEventSql(DbChangeEvent evt)
     {
+        SqlHelpers.AssertSafeIdentifier(evt.Table);
         var qualifiedTable = QualifyEventsTable(evt.Table, EventsSchema);
         var entityId = evt.GetPrimaryKey();
         var diff     = evt.Diff is { Length: > 0 }
@@ -706,9 +714,11 @@ public abstract class SqlDriverBase : IDriver, IDriverLifecycle, IDriverMigratio
 
     protected string BuildCreateTableBody(Schema schema)
     {
+        SqlHelpers.AssertSafeIdentifier(schema.Table);
         var sb = new StringBuilder();
         foreach (var col in schema.Columns())
         {
+            SqlHelpers.AssertSafeIdentifier(col);
             var prop   = schema.Properties[col];
             var isPk   = schema.PrimaryKeys.Contains(col);
             var notNull = schema.Required.Contains(col) && prop.IsNotNull ? " NOT NULL" : string.Empty;
