@@ -80,6 +80,7 @@ Alternatively, open **System Settings → Privacy & Security → Security** and 
 | `--verbose`       | Enable debug-level console output                                             |
 | `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode)|
 | `--events-schema` | Database schema for the events tables in `timeseries` mode (default: `eds_events`). MySQL ignores this — it uses a `__events` suffix in the same database instead. |
+| `--dry-run`       | Receive and decode events without writing to any destination. Useful for verifying NATS connectivity and schema decoding before configuring a driver. |
 
 ### `eds import` options
 

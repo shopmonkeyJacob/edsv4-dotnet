@@ -328,7 +328,10 @@ public sealed class NatsConsumerService : BackgroundService
     {
         var pending   = new List<(DbChangeEvent evt, INatsJSMsg<byte[]> msg, long receivedMs)>();
         DateTimeOffset? pendingStarted = null;
-        int batchSize = _driver.MaxBatchSize;
+        int batchSize    = _driver.MaxBatchSize;
+        // Mirrors Go: when the driver has no limit (≤ 0), fall back to MaxAckPending
+        // as the effective batch ceiling so unlimited drivers still flush by count.
+        int effectiveMax = batchSize > 0 ? batchSize : _config.MaxAckPending;
 
         // Channel decouples the continuous NATS consumer from our time-based flush logic.
         // Capacity of 4096 matches Go's PullMaxMessages(4096).
@@ -466,7 +469,10 @@ public sealed class NatsConsumerService : BackgroundService
 
                     bool shouldFlushNow = await _driver.ProcessAsync(_logger, evt, ct);
 
-                    if (shouldFlushNow || forceFlush || (batchSize > 0 && pending.Count >= batchSize))
+                    // Flush 1: driver-forced, migration, or driver batch size threshold.
+                    // effectiveMax falls back to MaxAckPending for unlimited drivers (≤ 0),
+                    // mirroring Go's maxsize logic.
+                    if (shouldFlushNow || forceFlush || pending.Count >= effectiveMax)
                     {
                         await FlushAndAckAsync(pending, ct);
                         pendingStarted = null;
@@ -474,11 +480,25 @@ public sealed class NatsConsumerService : BackgroundService
                     }
                 }
 
-                // Time-based flush
+                // Catch-up skip: if the stream has significantly more messages pending
+                // than our MaxAckPending ceiling, skip time-based flushing and keep
+                // accumulating to maximise throughput during catch-up. The 2× ceiling
+                // prevents infinite accumulation. Mirrors Go's NumPending check.
+                var numPending = natsMsg?.Metadata?.NumPending ?? 0UL;
+                if (numPending > (ulong)_config.MaxAckPending
+                    && pendingStarted is not null
+                    && DateTimeOffset.UtcNow - pendingStarted.Value < _config.MaxPendingLatency * 2)
+                {
+                    continue;
+                }
+
+                // Flush 2 + 3: count has reached the MaxAckPending ceiling, max latency
+                // has elapsed, or the buffer is momentarily empty after min latency.
                 if (pending.Count > 0 && pendingStarted is not null)
                 {
                     var elapsed = DateTimeOffset.UtcNow - pendingStarted.Value;
-                    if (elapsed >= _config.MaxPendingLatency ||
+                    if (pending.Count >= _config.MaxAckPending ||
+                        elapsed >= _config.MaxPendingLatency ||
                         (elapsed >= _config.MinPendingLatency && natsMsg is null))
                     {
                         await FlushAndAckAsync(pending, ct);
