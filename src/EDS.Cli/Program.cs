@@ -23,8 +23,7 @@ using System.CommandLine;
 using System.Runtime.InteropServices;
 
 // ── Shared log output templates ───────────────────────────────────────────────
-// Console: compact — timestamps only, no date.
-const string ConsoleTemplate = "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}";
+const string ConsoleTemplate = "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}";
 // File: full — date + time + timezone so log files are self-contained.
 const string FileTemplate    = "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}";
 

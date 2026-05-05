@@ -210,9 +210,9 @@ public sealed class ApiSchemaRegistry : ISchemaRegistry
             [AllSchemasTsKey]    = DateTimeOffset.UtcNow.ToString("O")
         };
 
-        foreach (var (tableName, schema) in apiMap)
+        foreach (var (_, schema) in apiMap)
         {
-            _latestSchemas[tableName] = schema;
+            _latestSchemas[schema.Table] = schema;
             var cacheKey = GetSchemaCacheKey(schema.Table, schema.ModelVersion);
             _schemaCache[cacheKey] = (schema, DateTimeOffset.UtcNow.Add(CacheTtl));
             toWrite[cacheKey] = JsonSerializer.Serialize(schema);
@@ -222,6 +222,11 @@ public sealed class ApiSchemaRegistry : ISchemaRegistry
         catch (Exception ex) { _logger.LogWarning(ex, "[schema] Could not persist schema cache to SQLite."); }
 
         _logger.LogInformation("[schema] Loaded {Count} table schemas from API.", _latestSchemas.Count);
+        if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            var sample = _latestSchemas.Take(5).Select(kvp => $"key='{kvp.Key}' table='{kvp.Value.Table}'");
+            _logger.LogDebug("[schema] Sample entries (key → schema.Table): {Sample}", string.Join(" | ", sample));
+        }
     }
 
     private async Task<CoreSchema?> FetchSchemaFromApiAsync(

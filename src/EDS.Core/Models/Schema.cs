@@ -81,6 +81,7 @@ public sealed class Schema
 /// <summary>Map of table name → Schema.</summary>
 public sealed class SchemaMap : Dictionary<string, Schema>
 {
+    public SchemaMap() : base(StringComparer.OrdinalIgnoreCase) { }
 }
 
 /// <summary>Map of table name → (column name → column type).</summary>

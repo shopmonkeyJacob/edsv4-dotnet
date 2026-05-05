@@ -108,6 +108,9 @@ public sealed class NdjsonGzImporter
             return;
 
         // ── Discover files ────────────────────────────────────────────────────
+        _logger.LogDebug("[import] Schema map has {Count} entries. Sample keys: [{Keys}]",
+            schemaMap.Count, string.Join(", ", schemaMap.Keys.Take(5)));
+
         var files = DiscoverFiles(_config.DataDir, _config.Tables);
         _logger.LogInformation("[import] Found {Count} file(s) to process.", files.Count);
 

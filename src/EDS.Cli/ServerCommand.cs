@@ -1,6 +1,7 @@
 using EDS.Core;
 using EDS.Core.Abstractions;
 using EDS.Core.Registry;
+using System.Net;
 using EDS.Infrastructure.Configuration;
 using EDS.Infrastructure.Metrics;
 using Microsoft.Extensions.Configuration;
@@ -12,7 +13,7 @@ namespace EDS.Cli;
 
 internal static class ServerCommand
 {
-    internal const string ConsoleTemplate = "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}";
+    internal const string ConsoleTemplate = "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}";
     internal const string FileTemplate    = "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}";
 
     public static async Task RunServerAsync(
@@ -86,6 +87,13 @@ internal static class ServerCommand
                 {
                     Log.Information("[server] {Message}", ex.Message);
                     await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                }
+                catch (HttpRequestException ex) when (
+                    ex.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                {
+                    Log.Fatal("[server] Authentication failed ({StatusCode}) — check your API key and re-enroll if needed.",
+                        (int)ex.StatusCode);
+                    return;
                 }
             }
             await tracker.SetKeyAsync(SessionService.LastCredsFileKey, credsFile, ct);
